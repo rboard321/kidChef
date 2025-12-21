@@ -5,33 +5,125 @@ import {
   StyleSheet,
   TouchableOpacity,
   Switch,
+  TextInput,
+  Alert,
+  ScrollView,
+  TouchableWithoutFeedback,
+  Keyboard,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
+import { useAuth } from '../../contexts/AuthContext';
+import type { UserSettings } from '../../types';
 
 interface ParentSettingsScreenProps {
   onComplete: () => void;
 }
 
-export default function ParentSettingsScreen({ onComplete }: ParentSettingsScreenProps) {
-  const [safetyNotes, setSafetyNotes] = useState(true);
-  const [readAloud, setReadAloud] = useState(true);
-  const [autoSimplify, setAutoSimplify] = useState(false);
+interface RouteParams {
+  kidData?: {
+    name: string;
+    age: number;
+    readingLevel: 'beginner' | 'intermediate' | 'advanced';
+  };
+}
 
-  const handleComplete = () => {
-    // TODO: Save settings and complete onboarding
-    console.log('Onboarding complete!');
-    // Call the onComplete function to update navigation state
-    onComplete();
+export default function ParentSettingsScreen({ onComplete }: ParentSettingsScreenProps) {
+  const route = useRoute();
+  const { kidData } = (route.params as RouteParams) || {};
+  const { user, updateProfile } = useAuth();
+
+  const [parentName, setParentName] = useState('');
+  const [familyName, setFamilyName] = useState('');
+  const [safetyNotes, setSafetyNotes] = useState(true);
+  const [readAloud, setReadAloud] = useState(false);
+  const [autoSimplify, setAutoSimplify] = useState(true);
+  const [showDifficulty, setShowDifficulty] = useState(true);
+  const [enableVoiceInstructions, setEnableVoiceInstructions] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const handleComplete = async () => {
+    if (!parentName.trim() || !familyName.trim()) {
+      Alert.alert('Missing Information', 'Please fill in all required fields.');
+      return;
+    }
+
+    if (!user) {
+      Alert.alert('Error', 'User not authenticated.');
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const userSettings: UserSettings = {
+        safetyNotes,
+        readAloud,
+        autoSimplify,
+        fontSize: 'medium',
+        temperatureUnit: 'fahrenheit',
+        language: 'en',
+        showDifficulty,
+        enableVoiceInstructions,
+        theme: 'light',
+      };
+
+      // Create user profile for backward compatibility
+      const userProfile = {
+        parentName: parentName.trim(),
+        kidName: kidData?.name || 'My Kid',
+        kidAge: kidData?.age || 8,
+        readingLevel: kidData?.readingLevel || 'beginner',
+        settings: userSettings,
+        email: user.email || '',
+      };
+
+      await updateProfile(userProfile);
+
+      // The AuthContext will automatically handle creating parent/kid profiles through migration
+      onComplete();
+    } catch (error) {
+      console.error('Error saving profile:', error);
+      Alert.alert('Error', 'Failed to save your information. Please try again.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.content}>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+        <ScrollView style={styles.scrollView} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <Text style={styles.title}>Parent Settings</Text>
         <Text style={styles.subtitle}>
-          Customize how recipes are presented to your child
+          Tell us about yourself and customize how recipes are presented to {kidData?.name || 'your child'}
         </Text>
+
+        <View style={styles.inputContainer}>
+          <Text style={styles.label}>Your Name</Text>
+          <TextInput
+            style={styles.input}
+            value={parentName}
+            onChangeText={setParentName}
+            placeholder="Enter your name"
+            placeholderTextColor="#9ca3af"
+            returnKeyType="next"
+            onSubmitEditing={Keyboard.dismiss}
+          />
+        </View>
+
+        <View style={styles.inputContainer}>
+          <Text style={styles.label}>Family Name</Text>
+          <TextInput
+            style={styles.input}
+            value={familyName}
+            onChangeText={setFamilyName}
+            placeholder="e.g., The Smith Family"
+            placeholderTextColor="#9ca3af"
+            returnKeyType="done"
+            onSubmitEditing={Keyboard.dismiss}
+          />
+        </View>
 
         <View style={styles.settingsContainer}>
           <View style={styles.setting}>
@@ -78,12 +170,49 @@ export default function ParentSettingsScreen({ onComplete }: ParentSettingsScree
               thumbColor={autoSimplify ? '#2563eb' : '#f3f4f6'}
             />
           </View>
+
+          <View style={styles.setting}>
+            <View style={styles.settingInfo}>
+              <Text style={styles.settingTitle}>Show Difficulty Levels</Text>
+              <Text style={styles.settingDescription}>
+                Display recipe difficulty ratings
+              </Text>
+            </View>
+            <Switch
+              value={showDifficulty}
+              onValueChange={setShowDifficulty}
+              trackColor={{ false: '#e5e7eb', true: '#93c5fd' }}
+              thumbColor={showDifficulty ? '#2563eb' : '#f3f4f6'}
+            />
+          </View>
+
+          <View style={styles.setting}>
+            <View style={styles.settingInfo}>
+              <Text style={styles.settingTitle}>Voice Instructions</Text>
+              <Text style={styles.settingDescription}>
+                Enable voice guidance for cooking steps
+              </Text>
+            </View>
+            <Switch
+              value={enableVoiceInstructions}
+              onValueChange={setEnableVoiceInstructions}
+              trackColor={{ false: '#e5e7eb', true: '#93c5fd' }}
+              thumbColor={enableVoiceInstructions ? '#2563eb' : '#f3f4f6'}
+            />
+          </View>
         </View>
 
-        <TouchableOpacity style={styles.button} onPress={handleComplete}>
-          <Text style={styles.buttonText}>Start Cooking! 🎉</Text>
+        <TouchableOpacity
+          style={[styles.button, (!parentName.trim() || !familyName.trim() || loading) && styles.buttonDisabled]}
+          onPress={handleComplete}
+          disabled={!parentName.trim() || !familyName.trim() || loading}
+        >
+          <Text style={styles.buttonText}>
+            {loading ? 'Setting up...' : 'Start Cooking! 🎉'}
+          </Text>
         </TouchableOpacity>
-      </View>
+        </ScrollView>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   );
 }
@@ -93,10 +222,12 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f8fafc',
   },
-  content: {
+  scrollView: {
     flex: 1,
+  },
+  content: {
     padding: 20,
-    justifyContent: 'center',
+    paddingBottom: 40,
   },
   title: {
     fontSize: 28,
@@ -104,17 +235,35 @@ const styles = StyleSheet.create({
     color: '#1f2937',
     textAlign: 'center',
     marginBottom: 10,
+    marginTop: 20,
   },
   subtitle: {
     fontSize: 16,
     color: '#6b7280',
     textAlign: 'center',
     lineHeight: 24,
-    marginBottom: 40,
-    paddingHorizontal: 20,
+    marginBottom: 30,
+  },
+  inputContainer: {
+    marginBottom: 20,
+  },
+  label: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1f2937',
+    marginBottom: 8,
+  },
+  input: {
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 12,
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
   },
   settingsContainer: {
-    marginBottom: 50,
+    marginBottom: 30,
+    marginTop: 20,
   },
   setting: {
     flexDirection: 'row',
@@ -148,6 +297,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     marginTop: 20,
+  },
+  buttonDisabled: {
+    backgroundColor: '#9ca3af',
   },
   buttonText: {
     color: 'white',

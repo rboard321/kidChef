@@ -4,6 +4,10 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
+  TextInput,
+  TouchableWithoutFeedback,
+  Keyboard,
+  ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
@@ -44,22 +48,64 @@ const levelOptions: LevelOption[] = [
 
 export default function KidLevelScreen() {
   const [selectedLevel, setSelectedLevel] = useState<ReadingLevel | null>(null);
+  const [kidName, setKidName] = useState('');
+  const [kidAge, setKidAge] = useState('');
   const navigation = useNavigation();
 
   const handleContinue = () => {
-    if (selectedLevel) {
-      // TODO: Save selected level to context/storage
-      navigation.navigate('ParentSettings' as never);
+    if (selectedLevel && kidName.trim() && kidAge.trim()) {
+      // Pass data to parent settings screen
+      navigation.navigate('ParentSettings' as never, {
+        kidData: {
+          name: kidName.trim(),
+          age: parseInt(kidAge),
+          readingLevel: selectedLevel,
+        }
+      } as never);
     }
   };
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.content}>
-        <Text style={styles.title}>Choose Your Kid's Experience Level</Text>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+        <ScrollView style={styles.scrollView} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        <Text style={styles.title}>Tell Us About Your Kid</Text>
         <Text style={styles.subtitle}>
           This helps us customize recipes and instructions for your child
         </Text>
+
+        <View style={styles.inputContainer}>
+          <Text style={styles.label}>Kid's Name</Text>
+          <TextInput
+            style={styles.input}
+            value={kidName}
+            onChangeText={setKidName}
+            placeholder="Enter your kid's name"
+            placeholderTextColor="#9ca3af"
+            returnKeyType="next"
+            blurOnSubmit={false}
+            onSubmitEditing={() => {
+              // Focus on age input - we'd need a ref for this, for now just dismiss
+              Keyboard.dismiss();
+            }}
+          />
+        </View>
+
+        <View style={styles.inputContainer}>
+          <Text style={styles.label}>Age</Text>
+          <TextInput
+            style={styles.input}
+            value={kidAge}
+            onChangeText={setKidAge}
+            placeholder="Enter age (e.g., 8)"
+            placeholderTextColor="#9ca3af"
+            keyboardType="numeric"
+            returnKeyType="done"
+            onSubmitEditing={Keyboard.dismiss}
+          />
+        </View>
+
+        <Text style={styles.sectionTitle}>Experience Level</Text>
 
         <View style={styles.optionsContainer}>
           {levelOptions.map((option) => (
@@ -85,13 +131,14 @@ export default function KidLevelScreen() {
         </View>
 
         <TouchableOpacity
-          style={[styles.button, !selectedLevel && styles.buttonDisabled]}
+          style={[styles.button, (!selectedLevel || !kidName.trim() || !kidAge.trim()) && styles.buttonDisabled]}
           onPress={handleContinue}
-          disabled={!selectedLevel}
+          disabled={!selectedLevel || !kidName.trim() || !kidAge.trim()}
         >
           <Text style={styles.buttonText}>Continue</Text>
         </TouchableOpacity>
-      </View>
+        </ScrollView>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   );
 }
@@ -101,10 +148,12 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f8fafc',
   },
-  content: {
+  scrollView: {
     flex: 1,
+  },
+  content: {
     padding: 20,
-    justifyContent: 'center',
+    paddingBottom: 40,
   },
   title: {
     fontSize: 28,
@@ -118,8 +167,32 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     textAlign: 'center',
     lineHeight: 24,
-    marginBottom: 40,
+    marginBottom: 30,
     paddingHorizontal: 20,
+  },
+  inputContainer: {
+    marginBottom: 20,
+  },
+  label: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1f2937',
+    marginBottom: 8,
+  },
+  input: {
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 12,
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#1f2937',
+    marginBottom: 20,
+    marginTop: 10,
   },
   optionsContainer: {
     marginBottom: 40,

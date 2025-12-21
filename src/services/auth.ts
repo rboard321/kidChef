@@ -26,20 +26,16 @@ export const authService: AuthService = {
     // Create user profile in Firestore
     const userProfile: UserProfile = {
       id: user.uid,
+      parentName: profile.parentName || '',
+      kidName: profile.kidName || '',
+      kidAge: profile.kidAge || 6,
+      readingLevel: profile.readingLevel || 'beginner',
       email: user.email || email,
-      hasCompletedOnboarding: false,
-      kidProfiles: [],
-      settings: {
-        safetyNotes: true,
-        readAloud: true,
-        autoSimplify: false,
-        notifications: true,
-        darkMode: false,
-      },
+      createdAt: new Date(),
       ...profile
     };
 
-    await setDoc(doc(db, 'users', user.uid), userProfile);
+    await setDoc(doc(db, 'userProfiles', user.uid), userProfile);
     return user;
   },
 
@@ -58,7 +54,7 @@ export const authService: AuthService = {
 
   async getUserProfile(userId: string): Promise<UserProfile | null> {
     try {
-      const docSnap = await getDoc(doc(db, 'users', userId));
+      const docSnap = await getDoc(doc(db, 'userProfiles', userId));
       if (docSnap.exists()) {
         return docSnap.data() as UserProfile;
       }
@@ -71,7 +67,7 @@ export const authService: AuthService = {
 
   async updateUserProfile(userId: string, profile: Partial<UserProfile>) {
     try {
-      await setDoc(doc(db, 'users', userId), profile, { merge: true });
+      await setDoc(doc(db, 'userProfiles', userId), profile, { merge: true });
     } catch (error) {
       console.error('Error updating user profile:', error);
       throw error;

@@ -86,8 +86,9 @@ export const recipeService: RecipeService = {
 
       // Sort locally instead of using Firestore orderBy
       return recipes.sort((a, b) => {
-        const aTime = a.updatedAt?.toMillis() || 0;
-        const bTime = b.updatedAt?.toMillis() || 0;
+        // Handle both Date objects and Firestore Timestamps
+        const aTime = a.updatedAt ? (a.updatedAt instanceof Date ? a.updatedAt.getTime() : a.updatedAt.toMillis()) : 0;
+        const bTime = b.updatedAt ? (b.updatedAt instanceof Date ? b.updatedAt.getTime() : b.updatedAt.toMillis()) : 0;
         return bTime - aTime;
       });
     } catch (error) {
