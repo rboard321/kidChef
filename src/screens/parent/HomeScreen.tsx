@@ -6,70 +6,246 @@ import {
   TouchableOpacity,
   FlatList,
   ActivityIndicator,
+  RefreshControl,
 } from 'react-native';
+import { Image } from 'expo-image';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { recipeService } from '../../services/recipes';
-import { AuthContext } from '../../contexts/AuthContext';
+import { useAuth } from '../../contexts/AuthContext';
+import { useImport } from '../../contexts/ImportContext';
+import { SkeletonRecipeList } from '../../components/SkeletonLoader';
+import { Toast } from '../../components/Toast';
+import { importProgressService } from '../../services/importProgressService';
+import { SearchBar } from '../../components/SearchBar';
+import { searchRecipes } from '../../utils/searchUtils';
 import type { Recipe } from '../../types';
 
 export default function ParentHomeScreen() {
   const navigation = useNavigation();
-  const { user } = useContext(AuthContext);
+  const { user, kidProfiles, setDeviceMode } = useAuth();
   const [recipes, setRecipes] = useState<Recipe[]>([]);
+  const [filteredRecipes, setFilteredRecipes] = useState<Recipe[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [toast, setToast] = useState<{ visible: boolean; message: string; type?: 'success' | 'info'; actionText?: string; onAction?: () => void }>({
+    visible: false,
+    message: '',
+  });
 
   useEffect(() => {
     loadRecipes();
   }, [user]);
 
   // Refresh recipes when screen comes into focus (e.g., after importing a recipe)
+  // Use silent refresh to avoid showing notifications every time user navigates back
   useFocusEffect(
     React.useCallback(() => {
       if (user?.uid) {
-        loadRecipes();
+        loadRecipes(); // Silent load without notifications
       }
     }, [user?.uid])
   );
 
-  const loadRecipes = async () => {
+  // Listen for import completions globally
+  useEffect(() => {
+    const unsubscribe = importProgressService.subscribeGlobal({
+      onProgress: (event) => {
+        if (event.type === 'complete' && event.recipe) {
+          // Auto-refresh recipes when a new one is imported
+          loadRecipes(false); // Silent refresh, no loading state
+
+          // Show success notification
+          setToast({
+            visible: true,
+            message: `✅ "${event.recipe.title}" added to your recipes!`,
+            type: 'success',
+            actionText: 'View Recipe',
+            onAction: () => {
+              navigation.navigate('RecipeDetail' as never, { recipeId: event.recipe!.id } as never);
+            }
+          });
+        } else if (event.type === 'error' && event.error) {
+          // Show error notification for failed imports
+          setToast({
+            visible: true,
+            message: `❌ Import failed: ${event.error.message}`,
+            type: 'info',
+            actionText: 'Try Again',
+            onAction: () => {
+              navigation.navigate('ImportRecipe' as never, { importUrl: event.url } as never);
+            }
+          });
+        }
+      }
+    });
+
+    return unsubscribe;
+  }, [navigation]);
+
+  // Handle search filtering
+  useEffect(() => {
+    if (searchQuery.trim() === '') {
+      setFilteredRecipes(recipes);
+    } else {
+      const filtered = searchRecipes(recipes, searchQuery);
+      setFilteredRecipes(filtered);
+    }
+  }, [searchQuery, recipes]);
+
+  const handleSearch = (query: string) => {
+    setSearchQuery(query);
+  };
+
+
+  const loadRecipes = async (isRefresh = false, showNotification = true) => {
     if (!user?.uid) return;
 
     try {
-      setLoading(true);
+      if (isRefresh) {
+        setRefreshing(true);
+      } else if (showNotification) {
+        setLoading(true);
+      }
+
+      const previousRecipeCount = recipes.length;
       const userRecipes = await recipeService.getUserRecipes(user.uid);
+
+      // Check if new recipes were added during a refresh (not initial load)
+      if (isRefresh && showNotification && userRecipes.length > previousRecipeCount) {
+        const newRecipeCount = userRecipes.length - previousRecipeCount;
+        setToast({
+          visible: true,
+          message: `${newRecipeCount} new recipe${newRecipeCount > 1 ? 's' : ''} ready! 🎉`,
+          type: 'success',
+        });
+      }
+
       setRecipes(userRecipes);
+      setFilteredRecipes(userRecipes);
     } catch (error) {
       console.error('Error loading recipes:', error);
     } finally {
-      setLoading(false);
+      if (isRefresh) {
+        setRefreshing(false);
+      } else if (showNotification) {
+        setLoading(false);
+      }
     }
+  };
+
+  const onRefresh = () => {
+    loadRecipes(true);
   };
 
   const handleRecipePress = (recipe: Recipe) => {
     navigation.navigate('RecipeDetail' as never, { recipeId: recipe.id } as never);
   };
 
-  const renderRecipe = ({ item }: { item: Recipe }) => (
-    <TouchableOpacity style={styles.recipeCard} onPress={() => handleRecipePress(item)}>
-      <Text style={styles.recipeEmoji}>{item.image || '🍽️'}</Text>
-      <Text style={styles.recipeTitle}>{item.title}</Text>
-      <Text style={styles.recipeAction}>Tap to view</Text>
-    </TouchableOpacity>
-  );
+  const renderRecipe = ({ item }: { item: Recipe }) => {
+    const hasImage = item.image && !item.image.includes('🍽️') && !item.image.includes('🥘') && item.image.startsWith('http');
+
+    return (
+      <TouchableOpacity style={styles.recipeCard} onPress={() => handleRecipePress(item)}>
+        {hasImage ? (
+          <View style={styles.recipeImageContainer}>
+            <Image
+              source={{ uri: item.image }}
+              style={styles.recipeImageBackground}
+              contentFit="cover"
+              cachePolicy="memory-disk"
+              transition={200}
+            />
+            <View style={styles.imageOverlay} />
+            <View style={styles.recipeContent}>
+              <Text style={styles.recipeTitleWithImage} numberOfLines={2}>{item.title}</Text>
+              <View style={styles.recipeDetails}>
+                <Text style={styles.recipeDetailText}>
+                  {item.servings} servings
+                </Text>
+                {item.totalTime && (
+                  <Text style={styles.recipeDetailText}>
+                    • {item.totalTime}
+                  </Text>
+                )}
+              </View>
+            </View>
+          </View>
+        ) : (
+          <View style={styles.recipeCardNoImage}>
+            <Text style={styles.recipeEmoji}>{item.image || '🍽️'}</Text>
+            <Text style={styles.recipeTitle} numberOfLines={2}>{item.title}</Text>
+            <View style={styles.recipeDetailsNoImage}>
+              <Text style={styles.recipeDetailNoImage}>
+                {item.servings} servings
+              </Text>
+              {item.totalTime && (
+                <Text style={styles.recipeDetailNoImage}>
+                  • {item.totalTime}
+                </Text>
+              )}
+            </View>
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <SafeAreaView style={styles.container}>
+      <Toast
+        visible={toast.visible}
+        message={toast.message}
+        type={toast.type}
+        onDismiss={() => setToast({ ...toast, visible: false })}
+        actionText={toast.actionText}
+        onAction={toast.onAction}
+      />
       <View style={styles.header}>
-        <Text style={styles.title}>My Recipes</Text>
-        <Text style={styles.subtitle}>Your family recipe collection</Text>
+        <View style={styles.headerContent}>
+          <View style={styles.titleContainer}>
+            <Text style={styles.title}>My Recipes</Text>
+            <Text style={styles.subtitle}>
+              {searchQuery ? `${filteredRecipes.length} of ${recipes.length} recipes` : 'Your family recipe collection'}
+            </Text>
+            {!loading && !refreshing && !searchQuery && (
+              <Text style={styles.pullToRefreshHint}>Pull down to refresh</Text>
+            )}
+          </View>
+          <View style={styles.headerButtons}>
+            {kidProfiles.length > 0 && (
+              <TouchableOpacity
+                style={styles.manageRecipesButton}
+                onPress={() => navigation.navigate('RecipeManagement' as never)}
+              >
+                <Text style={styles.manageRecipesButtonText}>🗑️ Manage</Text>
+              </TouchableOpacity>
+            )}
+            {kidProfiles.length > 0 && (
+              <TouchableOpacity
+                style={styles.kidModeButton}
+                onPress={() => setDeviceMode('kid')}
+              >
+                <Text style={styles.kidModeButtonText}>👶 Kid Mode</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
       </View>
 
-      {loading ? (
-        <View style={styles.emptyState}>
-          <ActivityIndicator size="large" color="#2563eb" />
-          <Text style={styles.emptyTitle}>Loading your recipes...</Text>
+      {!loading && recipes.length > 0 && (
+        <View style={styles.searchContainer}>
+          <SearchBar
+            placeholder="Search recipes, cuisine, ingredients..."
+            value={searchQuery}
+            onChangeText={handleSearch}
+          />
         </View>
+      )}
+
+      {loading ? (
+        <SkeletonRecipeList count={4} />
       ) : recipes.length === 0 ? (
         <View style={styles.emptyState}>
           <Text style={styles.emptyEmoji}>📱</Text>
@@ -78,14 +254,31 @@ export default function ParentHomeScreen() {
             Tap the Import tab to add your first recipe from any website
           </Text>
         </View>
+      ) : filteredRecipes.length === 0 && searchQuery ? (
+        <View style={styles.emptySearchState}>
+          <Text style={styles.emptySearchEmoji}>🔍</Text>
+          <Text style={styles.emptySearchTitle}>No recipes found</Text>
+          <Text style={styles.emptySearchText}>
+            Try adjusting your search term or browse all recipes
+          </Text>
+        </View>
       ) : (
         <FlatList
-          data={recipes}
+          data={filteredRecipes}
           renderItem={renderRecipe}
           keyExtractor={(item) => item.id}
           numColumns={2}
           columnWrapperStyle={styles.row}
           contentContainerStyle={styles.list}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              colors={['#2563eb']}
+              tintColor="#2563eb"
+              title="Pull to refresh recipes..."
+            />
+          }
         />
       )}
     </SafeAreaView>
@@ -101,6 +294,14 @@ const styles = StyleSheet.create({
     padding: 20,
     paddingTop: 10,
   },
+  headerContent: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  titleContainer: {
+    flex: 1,
+  },
   title: {
     fontSize: 28,
     fontWeight: 'bold',
@@ -111,6 +312,58 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#6b7280',
   },
+  pullToRefreshHint: {
+    fontSize: 14,
+    color: '#9ca3af',
+    fontStyle: 'italic',
+    marginTop: 4,
+  },
+  headerButtons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  searchContainer: {
+    paddingHorizontal: 20,
+    paddingBottom: 10,
+  },
+  manageRecipesButton: {
+    backgroundColor: '#dc2626',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
+  },
+  manageRecipesButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  kidModeButton: {
+    backgroundColor: '#10b981',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
+  },
+  kidModeButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   list: {
     padding: 10,
   },
@@ -118,19 +371,66 @@ const styles = StyleSheet.create({
     justifyContent: 'space-around',
   },
   recipeCard: {
-    backgroundColor: 'white',
     width: '45%',
-    aspectRatio: 1,
-    borderRadius: 12,
-    padding: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
+    aspectRatio: 1.1,
+    borderRadius: 16,
     marginBottom: 15,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 2,
+    shadowRadius: 8,
+    elevation: 3,
+    overflow: 'hidden',
+  },
+  recipeImageContainer: {
+    flex: 1,
+    position: 'relative',
+  },
+  recipeImageBackground: {
+    flex: 1,
+    borderRadius: 16,
+  },
+  recipeImage: {
+    borderRadius: 16,
+  },
+  imageOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    borderRadius: 16,
+  },
+  recipeContent: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    padding: 16,
+  },
+  recipeTitleWithImage: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: 'white',
+    marginBottom: 4,
+    textShadowColor: 'rgba(0, 0, 0, 0.5)',
+    textShadowOffset: { width: 1, height: 1 },
+    textShadowRadius: 2,
+  },
+  recipeDetails: {
+    flexDirection: 'row',
+  },
+  recipeDetailText: {
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.9)',
+    fontWeight: '500',
+    textShadowColor: 'rgba(0, 0, 0, 0.5)',
+    textShadowOffset: { width: 1, height: 1 },
+    textShadowRadius: 2,
+  },
+  recipeCardNoImage: {
+    backgroundColor: 'white',
+    flex: 1,
+    padding: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   recipeEmoji: {
     fontSize: 40,
@@ -141,11 +441,17 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#1f2937',
     textAlign: 'center',
-    marginBottom: 5,
+    marginBottom: 8,
+    lineHeight: 20,
   },
-  recipeAction: {
+  recipeDetailsNoImage: {
+    alignItems: 'center',
+  },
+  recipeDetailNoImage: {
     fontSize: 12,
-    color: '#2563eb',
+    color: '#6b7280',
+    textAlign: 'center',
+    fontWeight: '500',
   },
   emptyState: {
     flex: 1,
@@ -168,5 +474,27 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     textAlign: 'center',
     lineHeight: 24,
+  },
+  emptySearchState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+  },
+  emptySearchEmoji: {
+    fontSize: 60,
+    marginBottom: 20,
+  },
+  emptySearchTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#1f2937',
+    marginBottom: 10,
+  },
+  emptySearchText: {
+    fontSize: 14,
+    color: '#6b7280',
+    textAlign: 'center',
+    lineHeight: 20,
   },
 });

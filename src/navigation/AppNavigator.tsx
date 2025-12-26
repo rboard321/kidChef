@@ -1,9 +1,10 @@
-import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import React, { useEffect, useRef } from 'react';
+import { NavigationContainer, NavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../contexts/AuthContext';
+import { deepLinkService } from '../services/deepLinkService';
 
 // Auth screens
 import AuthScreen from '../screens/auth/AuthScreen';
@@ -16,11 +17,16 @@ import ParentSettingsScreen from '../screens/onboarding/ParentSettingsScreen';
 // Parent screens
 import ParentHomeScreen from '../screens/parent/HomeScreen';
 import ImportRecipeScreen from '../screens/parent/ImportRecipeScreen';
+import KidManagementScreen from '../screens/parent/KidManagementScreen';
 import RecipeDetailScreen from '../screens/parent/RecipeDetailScreen';
+import RecipeManagementScreen from '../screens/parent/RecipeManagementScreen';
 
 // Kid screens
 import KidHomeScreen from '../screens/kid/KidHomeScreen';
+import KidProfileSelector from '../screens/kid/KidProfileSelector';
 import RecipeViewScreen from '../screens/kid/RecipeViewScreen';
+import KidSettingsScreen from '../screens/kid/KidSettingsScreen';
+import BadgeCollectionScreen from '../screens/kid/BadgeCollectionScreen';
 
 // Shared screens
 import SettingsScreen from '../screens/shared/SettingsScreen';
@@ -43,6 +49,8 @@ function ParentTabNavigator() {
             iconName = focused ? 'home' : 'home-outline';
           } else if (route.name === 'Import') {
             iconName = focused ? 'add-circle' : 'add-circle-outline';
+          } else if (route.name === 'Kids') {
+            iconName = focused ? 'people' : 'people-outline';
           } else if (route.name === 'Settings') {
             iconName = focused ? 'settings' : 'settings-outline';
           } else {
@@ -67,6 +75,11 @@ function ParentTabNavigator() {
         options={{ title: 'Import Recipe' }}
       />
       <ParentTab.Screen
+        name="Kids"
+        component={KidManagementScreen}
+        options={{ title: 'Manage Kids' }}
+      />
+      <ParentTab.Screen
         name="Settings"
         component={SettingsScreen}
         options={{ title: 'Settings' }}
@@ -85,10 +98,8 @@ function KidTabNavigator() {
 
           if (route.name === 'Recipes') {
             iconName = focused ? 'restaurant' : 'restaurant-outline';
-          } else if (route.name === 'Cooking') {
-            iconName = focused ? 'flame' : 'flame-outline';
-          } else if (route.name === 'Parent') {
-            iconName = focused ? 'person' : 'person-outline';
+          } else if (route.name === 'Settings') {
+            iconName = focused ? 'settings' : 'settings-outline';
           } else {
             iconName = 'help-circle-outline';
           }
@@ -108,13 +119,8 @@ function KidTabNavigator() {
         options={{ title: 'My Recipes' }}
       />
       <KidTab.Screen
-        name="Cooking"
-        component={RecipeViewScreen}
-        options={{ title: 'Let\'s Cook!' }}
-      />
-      <KidTab.Screen
-        name="Parent"
-        component={SettingsScreen}
+        name="Settings"
+        component={KidSettingsScreen}
         options={{ title: 'Settings' }}
       />
     </KidTab.Navigator>
@@ -123,11 +129,15 @@ function KidTabNavigator() {
 
 // Main App Navigator
 export default function AppNavigator() {
-  const { user, loading, userProfile } = useAuth();
+  const { user, loading, parentProfile, deviceMode, currentKid, selectKid, setDeviceMode } = useAuth();
   const [hasCompletedOnboarding, setHasCompletedOnboarding] = React.useState(false);
+  const navigationRef = useRef<NavigationContainerRef<any>>(null);
 
-  // Determine current mode based on user profile
-  const currentMode = userProfile?.settings?.defaultMode || 'parent'; // 'parent' | 'kid'
+  useEffect(() => {
+    // Initialize deep linking service
+    deepLinkService.setNavigationRef(navigationRef);
+    deepLinkService.initialize();
+  }, []);
 
   // Function to complete onboarding
   const completeOnboarding = () => {
@@ -136,10 +146,11 @@ export default function AppNavigator() {
 
   // Check if user has completed onboarding
   React.useEffect(() => {
-    if (userProfile) {
+    if (parentProfile) {
       setHasCompletedOnboarding(true);
     }
-  }, [userProfile]);
+  }, [parentProfile]);
+
 
   // Show loading screen while checking auth
   if (loading) {
@@ -147,10 +158,10 @@ export default function AppNavigator() {
   }
 
   return (
-    <NavigationContainer>
+    <NavigationContainer ref={navigationRef}>
       <RootStack.Navigator screenOptions={{ headerShown: false }}>
         {!user ? (
-          // Not authenticated - show auth screens
+          // Not authenticated - show auth screen
           <RootStack.Screen name="Auth" component={AuthScreen} />
         ) : !hasCompletedOnboarding ? (
           // Authenticated but no profile - show onboarding
@@ -162,12 +173,50 @@ export default function AppNavigator() {
               children={() => <ParentSettingsScreen onComplete={completeOnboarding} />}
             />
           </>
+        ) : deviceMode === 'kid' ? (
+          // Device is in Kid Mode - show kid stack
+          <>
+            {!currentKid ? (
+              // No kid selected - show profile selector
+              <RootStack.Screen name="KidSelector">
+                {() => (
+                  <KidProfileSelector
+                    onKidSelected={(kid) => selectKid(kid.id)}
+                    onExitKidMode={() => setDeviceMode('parent')}
+                  />
+                )}
+              </RootStack.Screen>
+            ) : (
+              // Kid selected - show kid interface
+              <>
+                <RootStack.Screen
+                  name="Main"
+                  component={KidTabNavigator}
+                />
+                <RootStack.Screen
+                  name="RecipeView"
+                  component={RecipeViewScreen}
+                  options={{
+                    headerShown: true,
+                    title: 'Let\'s Cook!'
+                  }}
+                />
+                <RootStack.Screen
+                  name="BadgeCollection"
+                  component={BadgeCollectionScreen}
+                  options={{
+                    headerShown: false,
+                  }}
+                />
+              </>
+            )}
+          </>
         ) : (
-          // Authenticated and onboarded - show main app
+          // Device is in Parent Mode - show parent stack
           <>
             <RootStack.Screen
               name="Main"
-              component={currentMode === 'parent' ? ParentTabNavigator : KidTabNavigator}
+              component={ParentTabNavigator}
             />
             <RootStack.Screen
               name="RecipeDetail"
@@ -178,11 +227,11 @@ export default function AppNavigator() {
               }}
             />
             <RootStack.Screen
-              name="RecipeView"
-              component={RecipeViewScreen}
+              name="RecipeManagement"
+              component={RecipeManagementScreen}
               options={{
                 headerShown: true,
-                title: 'Let\'s Cook!'
+                title: 'Recipe Management'
               }}
             />
           </>

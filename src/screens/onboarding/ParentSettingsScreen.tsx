@@ -14,6 +14,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useAuth } from '../../contexts/AuthContext';
+import { parentProfileService } from '../../services/parentProfile';
+import { kidProfileService } from '../../services/kidProfile';
 import type { UserSettings } from '../../types';
 
 interface ParentSettingsScreenProps {
@@ -31,7 +33,7 @@ interface RouteParams {
 export default function ParentSettingsScreen({ onComplete }: ParentSettingsScreenProps) {
   const route = useRoute();
   const { kidData } = (route.params as RouteParams) || {};
-  const { user, updateProfile } = useAuth();
+  const { user, refreshProfile } = useAuth();
 
   const [parentName, setParentName] = useState('');
   const [familyName, setFamilyName] = useState('');
@@ -68,19 +70,32 @@ export default function ParentSettingsScreen({ onComplete }: ParentSettingsScree
         theme: 'light',
       };
 
-      // Create user profile for backward compatibility
-      const userProfile = {
+      const parentId = await parentProfileService.createParentProfile(user.uid, {
+        familyName: familyName.trim(),
         parentName: parentName.trim(),
-        kidName: kidData?.name || 'My Kid',
-        kidAge: kidData?.age || 8,
-        readingLevel: kidData?.readingLevel || 'beginner',
-        settings: userSettings,
         email: user.email || '',
-      };
+        settings: userSettings,
+      });
 
-      await updateProfile(userProfile);
+      const kidAge = kidData?.age || 8;
+      const kidProfileId = await kidProfileService.createKidProfile(parentId, {
+        name: kidData?.name || 'My Kid',
+        age: kidAge,
+        readingLevel: kidData?.readingLevel || 'beginner',
+        allergyFlags: [],
+        permissions: {
+          canViewIngredients: true,
+          canUseKnives: kidAge >= 10,
+          canUseStove: kidAge >= 12,
+          canUseOven: kidAge >= 14,
+          requiresAdultHelp: kidAge < 8,
+          maxCookingTimeMinutes: Math.min(60, Math.max(15, kidAge * 5)),
+        },
+        avatarEmoji: '👶',
+      });
 
-      // The AuthContext will automatically handle creating parent/kid profiles through migration
+      await parentProfileService.addKidToParent(parentId, kidProfileId);
+      await refreshProfile();
       onComplete();
     } catch (error) {
       console.error('Error saving profile:', error);

@@ -11,15 +11,20 @@ interface AuthContextType {
   userProfile: UserProfile | null; // Legacy profile for backward compatibility
   parentProfile: ParentProfile | null; // Enhanced parent profile
   kidProfiles: KidProfile[]; // All kids for this parent
-  currentKid: KidProfile | null; // Currently selected kid
+  currentKid: KidProfile | null; // Currently selected kid profile
+  deviceMode: 'parent' | 'kid'; // Device mode setting
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signUp: (email: string, password: string, profile: Partial<UserProfile>) => Promise<void>;
   signOut: () => Promise<void>;
+  setDeviceMode: (mode: 'parent' | 'kid') => void;
+  setDeviceModeWithPin: (mode: 'parent' | 'kid', pin?: string) => Promise<boolean>;
+  selectKid: (kidId: string | null) => void;
   updateProfile: (updates: Partial<UserProfile>) => Promise<void>;
   updateParentProfile: (updates: Partial<ParentProfile>) => Promise<void>;
+  setKidModePin: (pin: string) => Promise<void>;
+  changePIN: (newPin: string) => Promise<void>;
   refreshProfile: () => Promise<void>;
-  selectKid: (kidId: string | null) => void;
   addKid: (kidData: Omit<KidProfile, 'id' | 'parentId' | 'createdAt' | 'updatedAt'>) => Promise<string>;
   updateKid: (kidId: string, updates: Partial<KidProfile>) => Promise<void>;
   removeKid: (kidId: string) => Promise<void>;
@@ -42,6 +47,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [parentProfile, setParentProfile] = useState<ParentProfile | null>(null);
   const [kidProfiles, setKidProfiles] = useState<KidProfile[]>([]);
   const [currentKid, setCurrentKid] = useState<KidProfile | null>(null);
+  const [deviceMode, setDeviceMode] = useState<'parent' | 'kid'>('parent');
   const [loading, setLoading] = useState(true);
 
   const loadUserProfile = async (user: User) => {
@@ -69,11 +75,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (parent) {
         const kids = await kidProfileService.getParentKids(parent.id);
         setKidProfiles(kids);
-
-        // Set first kid as current if none selected
-        if (kids.length > 0 && !currentKid) {
-          setCurrentKid(kids[0]);
-        }
       } else {
         setKidProfiles([]);
         setCurrentKid(null);
@@ -100,6 +101,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setParentProfile(null);
         setKidProfiles([]);
         setCurrentKid(null);
+        setDeviceMode('parent');
       }
 
       setLoading(false);
@@ -137,6 +139,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+
   const updateProfile = async (updates: Partial<UserProfile>) => {
     if (!user) throw new Error('No user logged in');
 
@@ -161,6 +164,71 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const setKidModePin = async (pin: string) => {
+    if (!user) throw new Error('No user logged in');
+
+    try {
+      let targetParent = parentProfile;
+      if (!targetParent) {
+        await checkAndRunMigration();
+        targetParent = await parentProfileService.getParentProfile(user.uid);
+      }
+
+      if (!targetParent) throw new Error('No parent profile found');
+
+      await parentProfileService.updateParentProfile(targetParent.id, { kidModePin: pin });
+      await refreshProfile();
+    } catch (error) {
+      console.error('Error setting kid mode PIN:', error);
+      throw error;
+    }
+  };
+
+  const changePIN = async (newPin: string) => {
+    if (!user) throw new Error('No user logged in');
+    if (!parentProfile) throw new Error('No parent profile found');
+
+    try {
+      await parentProfileService.updateParentProfile(parentProfile.id, { kidModePin: newPin });
+      await refreshProfile();
+    } catch (error) {
+      console.error('Error changing PIN:', error);
+      throw error;
+    }
+  };
+
+  const setDeviceModeWithPin = async (mode: 'parent' | 'kid', pin?: string): Promise<boolean> => {
+    // If switching to kid mode, no PIN required
+    if (mode === 'kid') {
+      setCurrentKid(null);
+      setDeviceMode(mode);
+      return true;
+    }
+
+    // If switching from kid to parent mode, PIN is required
+    if (mode === 'parent' && deviceMode === 'kid') {
+      const storedPin = parentProfile?.kidModePin;
+
+      // If no PIN is set, allow access (for backward compatibility)
+      if (!storedPin) {
+        setDeviceMode(mode);
+        return true;
+      }
+
+      // Validate PIN
+      if (!pin) {
+        return false; // PIN required but not provided
+      }
+
+      if (pin !== storedPin) {
+        return false; // Invalid PIN
+      }
+    }
+
+    setDeviceMode(mode);
+    return true;
+  };
+
   const selectKid = (kidId: string | null) => {
     if (kidId) {
       const kid = kidProfiles.find(k => k.id === kidId);
@@ -171,7 +239,40 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const addKid = async (kidData: Omit<KidProfile, 'id' | 'parentId' | 'createdAt' | 'updatedAt'>) => {
-    if (!parentProfile) throw new Error('No parent profile found');
+    if (!user) throw new Error('No user logged in');
+
+    // Create parent profile if it doesn't exist
+    if (!parentProfile) {
+      console.log('No parent profile found, creating one...');
+      const defaultParentData = {
+        familyName: `${user.email?.split('@')[0] || 'Family'}'s Family`,
+        parentName: user.displayName || user.email?.split('@')[0] || 'Parent',
+        email: user.email || '',
+        settings: {
+          safetyNotes: true,
+          readAloud: false,
+          autoSimplify: false,
+          fontSize: 'medium' as const,
+          temperatureUnit: 'fahrenheit' as const,
+          language: 'en',
+          showDifficulty: true,
+          enableVoiceInstructions: false,
+          theme: 'light' as const,
+        },
+        kidIds: [],
+      };
+
+      const parentId = await parentProfileService.createParentProfile(user.uid, defaultParentData);
+      console.log('Parent profile created with ID:', parentId);
+
+      // Refresh to load the new parent profile
+      await refreshProfile();
+    }
+
+    // Now parentProfile should exist
+    if (!parentProfile) {
+      throw new Error('Failed to create parent profile');
+    }
 
     try {
       const kidId = await kidProfileService.createKidProfile(parentProfile.id, kidData);
@@ -213,6 +314,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+
   const checkAndRunMigration = async (): Promise<boolean> => {
     if (!user) return false;
 
@@ -236,14 +338,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     parentProfile,
     kidProfiles,
     currentKid,
+    deviceMode,
     loading,
     signIn,
     signUp,
     signOut,
+    setDeviceMode: (mode: 'parent' | 'kid') => {
+      if (mode === 'kid') {
+        setCurrentKid(null);
+      }
+      setDeviceMode(mode);
+    },
+    setDeviceModeWithPin,
+    selectKid,
     updateProfile,
     updateParentProfile,
+    setKidModePin,
+    changePIN,
     refreshProfile,
-    selectKid,
     addKid,
     updateKid,
     removeKid,

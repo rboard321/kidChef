@@ -1,4 +1,4 @@
-import React, { useState, useContext } from 'react';
+import React, { useState, useContext, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,59 +7,137 @@ import {
   StyleSheet,
   Alert,
   ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  TouchableWithoutFeedback,
+  Keyboard,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { recipeImportService } from '../../services/recipeImport';
-import { recipeService } from '../../services/recipes';
-import { AuthContext } from '../../contexts/AuthContext';
+import { useNavigation, useRoute } from '@react-navigation/native';
+import type { ImportError } from '../../services/recipeImport';
+import { useAuth } from '../../contexts/AuthContext';
+import { useImport } from '../../contexts/ImportContext';
+import { Toast } from '../../components/Toast';
+
+type ImportRecipeParams = {
+  importUrl?: string;
+};
 
 export default function ImportRecipeScreen() {
+  const navigation = useNavigation();
+  const route = useRoute();
+  const params = route.params as ImportRecipeParams;
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const { user } = useContext(AuthContext);
+  const [importError, setImportError] = useState<ImportError | null>(null);
+  const [toast, setToast] = useState<{ visible: boolean; message: string; type?: 'success' | 'error' }>({ visible: false, message: '' });
+  const { user } = useAuth();
+  const { importRecipe, getImportStatus } = useImport();
 
-  const handleImport = async () => {
-    if (!url.trim()) {
-      Alert.alert('Error', 'Please enter a recipe URL');
-      return;
+  // Handle deep link URL import
+  useEffect(() => {
+    if (params?.importUrl) {
+      setUrl(params.importUrl);
+      // Auto-start import if URL was provided via deep link
+      Alert.alert(
+        'Import Recipe from Share',
+        `Import recipe from: ${params.importUrl}?`,
+        [
+          {
+            text: 'Import',
+            onPress: () => handleImportWithUrl(params.importUrl!)
+          },
+          {
+            text: 'Cancel',
+            style: 'cancel',
+            onPress: () => navigation.goBack()
+          }
+        ]
+      );
     }
+  }, [params?.importUrl]);
 
-    if (!recipeImportService.validateUrl(url)) {
-      Alert.alert('Error', 'Please enter a valid URL (starting with http:// or https://)');
+
+
+  const handleImportWithUrl = async (targetUrl: string) => {
+    if (!targetUrl.trim()) {
+      setImportError({
+        code: 'EMPTY_URL',
+        message: 'Invalid recipe URL',
+        canRetry: false
+      });
       return;
     }
 
     if (!user?.uid) {
-      Alert.alert('Error', 'You must be logged in to import recipes');
+      setImportError({
+        code: 'UNAUTHENTICATED',
+        message: 'You must be logged in to import recipes',
+        canRetry: false
+      });
       return;
     }
 
     setLoading(true);
+    setImportError(null);
+
     try {
-      console.log('Importing recipe from URL...');
-      const recipe = await recipeImportService.importFromUrl(url);
+      await importRecipe(targetUrl);
 
-      console.log('Saving recipe to Firestore...');
-      const recipeId = await recipeService.addRecipe(user.uid, recipe);
+      // Show success message and navigate
+      setToast({
+        visible: true,
+        message: '📥 Recipe import started! We\'ll add it to your collection shortly.',
+        type: 'success'
+      });
 
-      console.log('Recipe saved with ID:', recipeId);
-      Alert.alert(
-        'Recipe Imported Successfully! 🎉',
-        `"${recipe.title}" has been added to your recipe collection and is now available in your recipes.`,
-        [{ text: 'OK', style: 'default' }]
-      );
-      setUrl('');
-    } catch (error) {
-      console.error('Import error:', error);
-      Alert.alert('Error', error instanceof Error ? error.message : 'Failed to import recipe. Please try again.');
-    } finally {
+      // Navigate to home after showing success message
+      setTimeout(() => {
+        navigation.navigate('Home' as never);
+      }, 2000);
+
+    } catch (error: any) {
+      console.error('Failed to start import:', error);
+      setImportError({
+        code: 'IMPORT_FAILED',
+        message: error?.message || 'Failed to start import',
+        canRetry: true
+      });
       setLoading(false);
     }
   };
 
+  const handleImport = async () => {
+    await handleImportWithUrl(url);
+  };
+
+
+  const handleRetry = () => {
+    setImportError(null);
+    if (url.trim()) {
+      handleImportWithUrl(url);
+    }
+  };
+
+
+  const handleManualEdit = () => {
+    (navigation as any).navigate('ManualRecipeEntry');
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.content}>
+      <Toast
+        visible={toast.visible}
+        message={toast.message}
+        type={toast.type}
+        onDismiss={() => setToast({ ...toast, visible: false })}
+      />
+      <KeyboardAvoidingView
+        style={styles.keyboardContainer}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      >
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={styles.content}>
         <View style={styles.header}>
           <Text style={styles.title}>Import Recipe</Text>
           <Text style={styles.subtitle}>
@@ -97,6 +175,32 @@ export default function ImportRecipeScreen() {
               <Text style={styles.buttonText}>Import Recipe</Text>
             )}
           </TouchableOpacity>
+
+
+
+          {/* Error Display */}
+          {importError && (
+            <View style={styles.errorContainer}>
+              <Text style={styles.errorTitle}>{importError.message}</Text>
+              {importError.suggestion && (
+                <Text style={styles.errorSuggestion}>{importError.suggestion}</Text>
+              )}
+
+              <View style={styles.errorActions}>
+                {importError.canRetry && (
+                  <TouchableOpacity style={styles.retryButton} onPress={handleRetry}>
+                    <Text style={styles.retryButtonText}>🔄 Try Again</Text>
+                  </TouchableOpacity>
+                )}
+
+                {importError.allowManualEdit && (
+                  <TouchableOpacity style={styles.manualButton} onPress={handleManualEdit}>
+                    <Text style={styles.manualButtonText}>✏️ Enter Manually</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          )}
         </View>
 
         <View style={styles.infoContainer}>
@@ -106,7 +210,9 @@ export default function ImportRecipeScreen() {
             ingredients, instructions, and other recipe details.
           </Text>
         </View>
-      </View>
+          </View>
+        </TouchableWithoutFeedback>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
@@ -115,6 +221,9 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#f8fafc',
+  },
+  keyboardContainer: {
+    flex: 1,
   },
   content: {
     flex: 1,
@@ -190,5 +299,55 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6b7280',
     lineHeight: 20,
+  },
+  errorContainer: {
+    backgroundColor: '#fef2f2',
+    borderColor: '#fecaca',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 16,
+    marginTop: 20,
+  },
+  errorTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#dc2626',
+    marginBottom: 8,
+  },
+  errorSuggestion: {
+    fontSize: 14,
+    color: '#7f1d1d',
+    lineHeight: 20,
+    marginBottom: 16,
+  },
+  errorActions: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  retryButton: {
+    flex: 1,
+    backgroundColor: '#dc2626',
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  retryButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  manualButton: {
+    flex: 1,
+    backgroundColor: 'white',
+    borderColor: '#dc2626',
+    borderWidth: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  manualButtonText: {
+    color: '#dc2626',
+    fontSize: 14,
+    fontWeight: '600',
   },
 });

@@ -1,11 +1,18 @@
 "use strict";
+var _a;
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.scrapeRecipeV2 = void 0;
+exports.deleteKidRecipe = exports.triggerQualityAutoRegeneration = exports.getQualityAnalytics = exports.reportUnclearStep = exports.rateKidRecipe = exports.getKidProfileById = exports.createKidProfile = exports.importRecipeSecure = exports.importRecipeHttp = exports.convertRecipeForKid = exports.scrapeRecipeV2 = void 0;
 const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 const axios_1 = require("axios");
 const cheerio = require("cheerio");
+const crypto = require("crypto");
+const openai_1 = require("openai");
 admin.initializeApp();
+// Initialize OpenAI - API key stored securely in environment variables
+const openai = new openai_1.default({
+    apiKey: ((_a = functions.config().openai) === null || _a === void 0 ? void 0 : _a.api_key) || process.env.OPENAI_API_KEY,
+});
 exports.scrapeRecipeV2 = functions.https.onCall(async (data, context) => {
     try {
         const { url } = data;
@@ -35,9 +42,222 @@ function isValidUrl(urlString) {
         return false;
     }
 }
-async function extractRecipeFromUrl(url) {
-    var _a;
+function normalizeUrlForCache(urlString) {
     try {
+        const url = new URL(urlString);
+        url.hash = '';
+        url.search = '';
+        return url.toString().replace(/\/+$/, '');
+    }
+    catch (_a) {
+        return urlString.trim().toLowerCase().replace(/\/+$/, '');
+    }
+}
+function hashString(input) {
+    let hash = 5381;
+    for (let i = 0; i < input.length; i += 1) {
+        hash = ((hash << 5) + hash) + input.charCodeAt(i);
+        hash >>>= 0;
+    }
+    return hash.toString(36);
+}
+async function getRecipeCache(url) {
+    const normalizedUrl = normalizeUrlForCache(url);
+    const cacheId = `recipe_${hashString(normalizedUrl)}`;
+    const doc = await admin.firestore().collection('recipeImportCache').doc(cacheId).get();
+    if (!doc.exists)
+        return null;
+    const data = doc.data();
+    const cached = {
+        title: data.title,
+        description: data.description || '',
+        image: data.image || '',
+        prepTime: data.prepTime || '',
+        cookTime: data.cookTime || '',
+        totalTime: data.totalTime || '',
+        servings: data.servings,
+        difficulty: data.difficulty,
+        ingredients: data.ingredients,
+        instructions: data.instructions,
+        sourceUrl: url,
+        tags: data.tags || []
+    };
+    if (cached.ingredients.length < 3 || cached.instructions.length < 3) {
+        console.log('Scrape debug: cache skipped due to low data', {
+            url,
+            ingredientCount: cached.ingredients.length,
+            instructionCount: cached.instructions.length
+        });
+        return null;
+    }
+    return cached;
+}
+async function setRecipeCache(url, recipe, provider) {
+    const normalizedUrl = normalizeUrlForCache(url);
+    const cacheId = `recipe_${hashString(normalizedUrl)}`;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const entry = {
+        sourceUrl: url,
+        normalizedUrl,
+        title: recipe.title,
+        description: recipe.description || '',
+        image: recipe.image || '',
+        prepTime: recipe.prepTime || '',
+        cookTime: recipe.cookTime || '',
+        totalTime: recipe.totalTime || '',
+        servings: recipe.servings,
+        difficulty: recipe.difficulty,
+        ingredients: recipe.ingredients,
+        instructions: recipe.instructions,
+        tags: recipe.tags || [],
+        createdAt: now,
+        updatedAt: now,
+        provider
+    };
+    await admin.firestore().collection('recipeImportCache').doc(cacheId).set(entry, { merge: true });
+}
+function validateAndCleanRecipe(recipe, url) {
+    var _a, _b, _c, _d, _e, _f;
+    // Validate required fields
+    if (!recipe.title || recipe.title.trim().length === 0) {
+        throw new Error('Recipe must have a title');
+    }
+    if (!recipe.ingredients || recipe.ingredients.length === 0) {
+        throw new Error('Recipe must have at least one ingredient');
+    }
+    if (!recipe.instructions || recipe.instructions.length === 0) {
+        throw new Error('No cooking instructions found. This site might not expose steps properly. Try another recipe or enter manually.');
+    }
+    // Clean and validate ingredients
+    const cleanedIngredients = recipe.ingredients
+        .map(ingredient => ingredient.trim())
+        .filter(ingredient => ingredient.length > 0)
+        .map(ingredient => {
+        // Remove any HTML tags that might have slipped through
+        return ingredient.replace(/<[^>]*>/g, '');
+    });
+    if (cleanedIngredients.length === 0) {
+        throw new Error('No valid ingredients found');
+    }
+    // Clean and validate instructions
+    const cleanedInstructions = recipe.instructions
+        .map(instruction => instruction.trim())
+        .filter(instruction => instruction.length > 0)
+        .map(instruction => {
+        // Remove any HTML tags that might have slipped through
+        let cleaned = instruction.replace(/<[^>]*>/g, '');
+        // Ensure instruction ends with period if it doesn't end with punctuation
+        if (cleaned && !/[.!?]$/.test(cleaned)) {
+            cleaned += '.';
+        }
+        return cleaned;
+    });
+    if (cleanedInstructions.length === 0) {
+        throw new Error('No cooking instructions found. This site might not expose steps properly. Try another recipe or enter manually.');
+    }
+    // Validate title length (reasonable bounds)
+    const cleanedTitle = recipe.title.trim();
+    if (cleanedTitle.length > 200) {
+        throw new Error('Recipe title is too long - this might not be a recipe page');
+    }
+    // Clean servings - ensure it's a reasonable number
+    let cleanedServings = recipe.servings;
+    if (cleanedServings && (cleanedServings < 1 || cleanedServings > 50)) {
+        cleanedServings = 4; // Default to 4 servings if unreasonable
+    }
+    return {
+        title: cleanedTitle,
+        description: ((_a = recipe.description) === null || _a === void 0 ? void 0 : _a.trim()) || '',
+        image: ((_b = recipe.image) === null || _b === void 0 ? void 0 : _b.trim()) || '',
+        prepTime: ((_c = recipe.prepTime) === null || _c === void 0 ? void 0 : _c.trim()) || '',
+        cookTime: ((_d = recipe.cookTime) === null || _d === void 0 ? void 0 : _d.trim()) || '',
+        totalTime: ((_e = recipe.totalTime) === null || _e === void 0 ? void 0 : _e.trim()) || '',
+        servings: cleanedServings || 4,
+        difficulty: ((_f = recipe.difficulty) === null || _f === void 0 ? void 0 : _f.trim()) || 'Medium',
+        ingredients: cleanedIngredients,
+        instructions: cleanedInstructions,
+        sourceUrl: url,
+        tags: recipe.tags || []
+    };
+}
+async function extractRecipeWithAI(url, html, hints) {
+    var _a, _b, _c;
+    const apiKey = ((_a = functions.config().openai) === null || _a === void 0 ? void 0 : _a.api_key) || process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+        throw new Error('OpenAI API key not configured for AI fallback');
+    }
+    const $ = cheerio.load(html);
+    const articleText = $('article').text() || $('main').text() || $('.recipe').text() || $('.entry-content').text() || $('body').text();
+    const cleanedText = articleText.replace(/\s+/g, ' ').trim().slice(0, 15000);
+    const prompt = `You are extracting recipe data from a web page.
+Return JSON only with this shape:
+{
+  "title": "string",
+  "description": "string",
+  "image": "string",
+  "prepTime": "string",
+  "cookTime": "string",
+  "totalTime": "string",
+  "servings": number_or_null,
+  "difficulty": "string",
+  "ingredients": ["string"],
+  "instructions": ["string"],
+  "tags": ["string"]
+}
+
+Use only the provided text. If a field is missing, use empty string or empty array. Ingredients and instructions must be arrays of strings.
+
+Title hint: ${hints.title || 'unknown'}
+URL: ${url}
+PAGE TEXT:
+${cleanedText}`;
+    const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+            { role: 'system', content: 'You extract recipe data and respond with JSON only.' },
+            { role: 'user', content: prompt }
+        ],
+        temperature: 0.2,
+        max_tokens: 4000,
+    });
+    const content = ((_c = (_b = response.choices[0]) === null || _b === void 0 ? void 0 : _b.message) === null || _c === void 0 ? void 0 : _c.content) || '';
+    const jsonText = content
+        .replace(/```json/g, '')
+        .replace(/```/g, '')
+        .trim();
+    const parsed = JSON.parse(jsonText);
+    const aiRecipe = {
+        title: parsed.title,
+        description: parsed.description,
+        image: parsed.image,
+        prepTime: parsed.prepTime,
+        cookTime: parsed.cookTime,
+        totalTime: parsed.totalTime,
+        servings: parsed.servings,
+        difficulty: parsed.difficulty,
+        ingredients: Array.isArray(parsed.ingredients) ? parsed.ingredients : [],
+        instructions: Array.isArray(parsed.instructions) ? parsed.instructions : [],
+        tags: Array.isArray(parsed.tags) ? parsed.tags : []
+    };
+    const validated = validateAndCleanRecipe(aiRecipe, url);
+    if (!validated) {
+        throw new Error('AI fallback did not return a valid recipe');
+    }
+    console.log('Scrape debug: AI fallback success', {
+        title: validated.title,
+        ingredientCount: validated.ingredients.length,
+        instructionCount: validated.instructions.length
+    });
+    return validated;
+}
+async function extractRecipeFromUrl(url) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+    try {
+        const cached = await getRecipeCache(url);
+        if (cached) {
+            console.log('Scrape debug: cache hit', { url });
+            return cached;
+        }
         // Fetch the webpage
         const response = await axios_1.default.get(url, {
             timeout: 10000,
@@ -47,59 +267,104 @@ async function extractRecipeFromUrl(url) {
             },
         });
         const $ = cheerio.load(response.data);
+        const jsonLdScripts = $('script[type="application/ld+json"]');
+        console.log('Scrape debug:', {
+            url,
+            jsonLdScriptCount: jsonLdScripts.length,
+            htmlLength: ((_a = response.data) === null || _a === void 0 ? void 0 : _a.length) || 0
+        });
         // Try to extract from JSON-LD structured data first (most reliable)
         const jsonLdRecipe = extractFromJsonLd($);
         if (jsonLdRecipe && jsonLdRecipe.title) {
-            return {
-                title: jsonLdRecipe.title,
-                description: jsonLdRecipe.description,
-                image: jsonLdRecipe.image,
-                prepTime: jsonLdRecipe.prepTime,
-                cookTime: jsonLdRecipe.cookTime,
-                totalTime: jsonLdRecipe.totalTime,
-                servings: jsonLdRecipe.servings,
-                difficulty: jsonLdRecipe.difficulty,
-                ingredients: jsonLdRecipe.ingredients || [],
-                instructions: jsonLdRecipe.instructions || [],
-                sourceUrl: url,
-                tags: jsonLdRecipe.tags
-            };
+            // Add meta tag image fallback if no image found in structured data
+            if (!jsonLdRecipe.image) {
+                jsonLdRecipe.image = extractImageFromMetaTags($);
+            }
+            try {
+                const validated = validateAndCleanRecipe(jsonLdRecipe, url);
+                if (validated) {
+                    console.log('Scrape debug: JSON-LD success', {
+                        title: validated.title,
+                        hasImage: !!validated.image,
+                        ingredientCount: validated.ingredients.length,
+                        instructionCount: validated.instructions.length
+                    });
+                    await setRecipeCache(url, validated, 'scrape');
+                    return validated;
+                }
+            }
+            catch (error) {
+                console.warn('Scrape debug: JSON-LD validation failed', {
+                    error: error instanceof Error ? error.message : String(error),
+                    ingredientCount: ((_b = jsonLdRecipe.ingredients) === null || _b === void 0 ? void 0 : _b.length) || 0,
+                    instructionCount: ((_c = jsonLdRecipe.instructions) === null || _c === void 0 ? void 0 : _c.length) || 0
+                });
+            }
         }
         // Fall back to microdata extraction
         const microdataRecipe = extractFromMicrodata($);
         if (microdataRecipe && microdataRecipe.title) {
-            return {
-                title: microdataRecipe.title,
-                description: microdataRecipe.description,
-                image: microdataRecipe.image,
-                prepTime: microdataRecipe.prepTime,
-                cookTime: microdataRecipe.cookTime,
-                totalTime: microdataRecipe.totalTime,
-                servings: microdataRecipe.servings,
-                difficulty: microdataRecipe.difficulty,
-                ingredients: microdataRecipe.ingredients || [],
-                instructions: microdataRecipe.instructions || [],
-                sourceUrl: url,
-                tags: microdataRecipe.tags
-            };
+            // Add meta tag image fallback if no image found in microdata
+            if (!microdataRecipe.image) {
+                microdataRecipe.image = extractImageFromMetaTags($);
+            }
+            try {
+                const validated = validateAndCleanRecipe(microdataRecipe, url);
+                if (validated) {
+                    console.log('Scrape debug: Microdata success', {
+                        title: validated.title,
+                        hasImage: !!validated.image,
+                        ingredientCount: validated.ingredients.length,
+                        instructionCount: validated.instructions.length
+                    });
+                    await setRecipeCache(url, validated, 'scrape');
+                    return validated;
+                }
+            }
+            catch (error) {
+                console.warn('Scrape debug: Microdata validation failed', {
+                    error: error instanceof Error ? error.message : String(error),
+                    ingredientCount: ((_d = microdataRecipe.ingredients) === null || _d === void 0 ? void 0 : _d.length) || 0,
+                    instructionCount: ((_e = microdataRecipe.instructions) === null || _e === void 0 ? void 0 : _e.length) || 0
+                });
+            }
         }
         // Fall back to common CSS selectors
         const cssRecipe = extractFromCommonSelectors($);
         if (cssRecipe && cssRecipe.title) {
-            return {
-                title: cssRecipe.title,
-                description: cssRecipe.description,
-                image: cssRecipe.image,
-                prepTime: cssRecipe.prepTime,
-                cookTime: cssRecipe.cookTime,
-                totalTime: cssRecipe.totalTime,
-                servings: cssRecipe.servings,
-                difficulty: cssRecipe.difficulty,
-                ingredients: cssRecipe.ingredients || [],
-                instructions: cssRecipe.instructions || [],
-                sourceUrl: url,
-                tags: cssRecipe.tags
-            };
+            // Always add meta tag image for CSS selectors since they don't extract images
+            if (!cssRecipe.image) {
+                cssRecipe.image = extractImageFromMetaTags($);
+            }
+            try {
+                const validated = validateAndCleanRecipe(cssRecipe, url);
+                if (validated) {
+                    console.log('Scrape debug: CSS selectors success', {
+                        title: validated.title,
+                        hasImage: !!validated.image,
+                        ingredientCount: validated.ingredients.length,
+                        instructionCount: validated.instructions.length
+                    });
+                    await setRecipeCache(url, validated, 'scrape');
+                    return validated;
+                }
+            }
+            catch (error) {
+                console.warn('Scrape debug: CSS selectors validation failed', {
+                    error: error instanceof Error ? error.message : String(error),
+                    ingredientCount: ((_f = cssRecipe.ingredients) === null || _f === void 0 ? void 0 : _f.length) || 0,
+                    instructionCount: ((_g = cssRecipe.instructions) === null || _g === void 0 ? void 0 : _g.length) || 0
+                });
+            }
+        }
+        const candidate = jsonLdRecipe || microdataRecipe || cssRecipe;
+        const hasMissingCoreData = !!candidate && (!((_h = candidate.ingredients) === null || _h === void 0 ? void 0 : _h.length) || !((_j = candidate.instructions) === null || _j === void 0 ? void 0 : _j.length));
+        if (hasMissingCoreData) {
+            const fallback = await extractRecipeWithAI(url, response.data, {
+                title: candidate === null || candidate === void 0 ? void 0 : candidate.title
+            });
+            await setRecipeCache(url, fallback, 'ai');
+            return fallback;
         }
         throw new Error('No recipe data found on this page');
     }
@@ -108,7 +373,7 @@ async function extractRecipeFromUrl(url) {
             if (error.code === 'ENOTFOUND') {
                 throw new Error('Website not found');
             }
-            if (((_a = error.response) === null || _a === void 0 ? void 0 : _a.status) === 404) {
+            if (((_k = error.response) === null || _k === void 0 ? void 0 : _k.status) === 404) {
                 throw new Error('Recipe page not found');
             }
             if (error.code === 'ECONNABORTED') {
@@ -117,6 +382,69 @@ async function extractRecipeFromUrl(url) {
         }
         throw error;
     }
+}
+function extractImageFromMetaTags($) {
+    // Priority order: og:image, twitter:image, fallback image selectors
+    const imageSelectors = [
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]',
+        'link[rel="image_src"]',
+        // Common recipe site image selectors
+        '.recipe-image img',
+        '.recipe-hero img',
+        '.recipe-photo img',
+        '[class*="recipe-image"] img',
+        '.post-thumbnail img',
+        '.featured-image img'
+    ];
+    for (const selector of imageSelectors) {
+        let imageUrl;
+        if (selector.startsWith('meta') || selector.startsWith('link')) {
+            // Meta tags and link tags
+            const element = $(selector).first();
+            imageUrl = element.attr('content') || element.attr('href');
+        }
+        else {
+            // Image tags
+            const imgElement = $(selector).first();
+            imageUrl = imgElement.attr('src') || imgElement.attr('data-src');
+        }
+        if (imageUrl) {
+            // Clean and validate the image URL
+            const cleanedUrl = imageUrl.trim();
+            // Skip if it's not a valid image URL
+            if (!cleanedUrl || cleanedUrl === '#' || cleanedUrl === '/' || cleanedUrl.length < 10) {
+                continue;
+            }
+            // Skip common placeholder/loading images
+            const skipPatterns = [
+                'placeholder', 'loading', 'spinner', 'default',
+                '1x1', 'pixel', 'spacer', 'blank'
+            ];
+            if (skipPatterns.some(pattern => cleanedUrl.toLowerCase().includes(pattern))) {
+                continue;
+            }
+            // Reassign cleaned URL
+            imageUrl = cleanedUrl;
+            // Convert relative URLs to absolute
+            if (imageUrl.startsWith('//')) {
+                imageUrl = 'https:' + imageUrl;
+            }
+            else if (imageUrl.startsWith('/')) {
+                // Would need the base URL to make this absolute - skip for now
+                continue;
+            }
+            // Check if it's a valid image file extension or has image query params
+            const hasImageExtension = /\.(jpg|jpeg|png|gif|webp|avif)(\?.*)?$/i.test(imageUrl);
+            const isHttpsUrl = imageUrl.startsWith('https://');
+            if (isHttpsUrl && (hasImageExtension || imageUrl.includes('image') || selector.includes('og:') || selector.includes('twitter:'))) {
+                return imageUrl;
+            }
+        }
+    }
+    return undefined;
 }
 function extractFromJsonLd($) {
     try {
@@ -179,6 +507,77 @@ function parseJsonLdRecipe(recipe) {
         }
         return [extractText(value)].filter(Boolean);
     };
+    const extractInstructions = (instructions) => {
+        if (!instructions)
+            return [];
+        const processInstruction = (instruction) => {
+            // Handle HowToStep objects
+            if (instruction && typeof instruction === 'object') {
+                if (Array.isArray(instruction.itemListElement)) {
+                    return instruction.itemListElement.map(processInstruction).filter(Boolean).join('\n');
+                }
+                if (Array.isArray(instruction.steps)) {
+                    return instruction.steps.map(processInstruction).filter(Boolean).join('\n');
+                }
+                // Standard HowToStep with text property
+                if (instruction.text) {
+                    return extractText(instruction.text);
+                }
+                // Some sites use name instead of text
+                if (instruction.name) {
+                    return extractText(instruction.name);
+                }
+                // Some use description
+                if (instruction.description) {
+                    return extractText(instruction.description);
+                }
+                // Handle @type HowToStep
+                if (instruction['@type'] === 'HowToStep') {
+                    return instruction.text || instruction.name || instruction.description || '';
+                }
+                if (instruction['@type'] === 'HowToSection' && instruction.itemListElement) {
+                    const sectionSteps = Array.isArray(instruction.itemListElement)
+                        ? instruction.itemListElement
+                        : [instruction.itemListElement];
+                    return sectionSteps.map(processInstruction).filter(Boolean).join('\n');
+                }
+                if (instruction['@type'] === 'ItemList' && instruction.itemListElement) {
+                    const listSteps = Array.isArray(instruction.itemListElement)
+                        ? instruction.itemListElement
+                        : [instruction.itemListElement];
+                    return listSteps.map(processInstruction).filter(Boolean).join('\n');
+                }
+                // If it's an object but no recognizable text, try to extract text from it
+                return extractText(instruction);
+            }
+            // Handle plain strings
+            return extractText(instruction);
+        };
+        let result = [];
+        if (Array.isArray(instructions)) {
+            result = instructions.map(processInstruction).filter(Boolean);
+        }
+        else {
+            const processed = processInstruction(instructions);
+            if (processed)
+                result = [processed];
+        }
+        // Clean up instruction text
+        const flattened = result.flatMap((instruction) => instruction.split('\n').map(step => step.trim()).filter(Boolean));
+        return flattened.map((instruction, index) => {
+            let cleaned = instruction
+                // Remove step numbers at the beginning
+                .replace(/^\d+\.\s*/, '')
+                .replace(/^Step\s+\d+:?\s*/i, '')
+                // Remove extra whitespace
+                .trim();
+            // Ensure instruction ends with period if it doesn't end with punctuation
+            if (cleaned && !/[.!?]$/.test(cleaned)) {
+                cleaned += '.';
+            }
+            return cleaned;
+        }).filter(Boolean);
+    };
     const extractTime = (duration) => {
         if (!duration)
             return '';
@@ -202,25 +601,57 @@ function parseJsonLdRecipe(recipe) {
         if (typeof value === 'number')
             return value;
         if (typeof value === 'string') {
-            const num = parseInt(value);
-            return isNaN(num) ? undefined : num;
+            const str = value.toString().trim();
+            // Handle fractions like "1/2", "3/4", etc.
+            const fractionMatch = str.match(/^(\d+)\/(\d+)$/);
+            if (fractionMatch) {
+                const numerator = parseFloat(fractionMatch[1]);
+                const denominator = parseFloat(fractionMatch[2]);
+                return denominator !== 0 ? numerator / denominator : undefined;
+            }
+            // Handle mixed numbers like "1 1/2", "2 3/4"
+            const mixedMatch = str.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+            if (mixedMatch) {
+                const whole = parseFloat(mixedMatch[1]);
+                const numerator = parseFloat(mixedMatch[2]);
+                const denominator = parseFloat(mixedMatch[3]);
+                return denominator !== 0 ? whole + (numerator / denominator) : undefined;
+            }
+            // Handle ranges like "2-3", "4-6" - take the middle value
+            const rangeMatch = str.match(/^(\d+(?:\.\d+)?)\s*[-–—]\s*(\d+(?:\.\d+)?)$/);
+            if (rangeMatch) {
+                const min = parseFloat(rangeMatch[1]);
+                const max = parseFloat(rangeMatch[2]);
+                return !isNaN(min) && !isNaN(max) ? (min + max) / 2 : undefined;
+            }
+            // Handle "about", "approximately" prefixes
+            const approxMatch = str.match(/(?:about|approximately|around|~)\s*(\d+(?:\.\d+)?)/i);
+            if (approxMatch) {
+                const num = parseFloat(approxMatch[1]);
+                return !isNaN(num) ? num : undefined;
+            }
+            // Extract first number from string (handles cases like "4 servings", "serves 6", etc.)
+            const numberMatch = str.match(/(\d+(?:\.\d+)?)/);
+            if (numberMatch) {
+                const num = parseFloat(numberMatch[1]);
+                return !isNaN(num) ? num : undefined;
+            }
+            return undefined;
         }
         return undefined;
     };
+    const structuredImage = extractText(((_a = recipe.image) === null || _a === void 0 ? void 0 : _a.url) || recipe.image);
     return {
         title: extractText(recipe.name),
         description: extractText(recipe.description),
-        image: extractText(((_a = recipe.image) === null || _a === void 0 ? void 0 : _a.url) || recipe.image),
+        image: structuredImage,
         prepTime: extractTime(recipe.prepTime),
         cookTime: extractTime(recipe.cookTime),
         totalTime: extractTime(recipe.totalTime),
         servings: extractNumber(recipe.recipeYield || recipe.yield),
         ingredients: extractArray(recipe.recipeIngredient),
         instructions: recipe.recipeInstructions ?
-            extractArray(recipe.recipeInstructions).map((instruction, index) => {
-                // Clean up instruction text
-                return instruction.replace(/^\d+\.\s*/, '').trim();
-            }) : [],
+            extractInstructions(recipe.recipeInstructions) : [],
         tags: extractArray(recipe.recipeCategory).concat(extractArray(recipe.recipeCuisine)),
     };
 }
@@ -307,5 +738,1796 @@ function findMultipleTextBySelectors($, selectors) {
         }
     }
     return [];
+}
+// Rate limiting constants - temporarily increased for development
+const MAX_DAILY_IMPORTS = 50; // Increased from 10 for development
+const MAX_DAILY_CONVERSIONS = 100; // Increased from 20 for development
+const MAX_IMPORTS_PER_HOUR = 20; // Increased from 5 for development
+const MAX_CONVERSIONS_PER_HOUR = 40; // Increased from 10 for development
+// Cloud Function to convert recipes to kid-friendly versions with caching and rate limiting
+exports.convertRecipeForKid = functions.https.onCall(async (data, context) => {
+    try {
+        // Authentication check
+        if (!context.auth) {
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const { recipeId, kidAge, readingLevel, allergyFlags = [] } = data;
+        // Input validation
+        if (!recipeId || !kidAge || !readingLevel) {
+            throw new functions.https.HttpsError('invalid-argument', 'Missing required fields');
+        }
+        if (kidAge < 3 || kidAge > 18) {
+            throw new functions.https.HttpsError('invalid-argument', 'Kid age must be between 3 and 18');
+        }
+        if (!['beginner', 'intermediate', 'advanced'].includes(readingLevel)) {
+            throw new functions.https.HttpsError('invalid-argument', 'Invalid reading level');
+        }
+        // Check rate limits
+        await checkConversionRateLimit(context.auth.uid);
+        // Get the original recipe
+        const recipeDoc = await admin.firestore().collection('recipes').doc(recipeId).get();
+        if (!recipeDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Recipe not found');
+        }
+        const recipe = recipeDoc.data();
+        if (!recipe) {
+            throw new functions.https.HttpsError('internal', 'Recipe data is invalid');
+        }
+        // Verify user owns this recipe
+        const isOwner = recipe.userId === context.auth.uid ||
+            (recipe.parentId && await isUserOwnerOfParentProfile(context.auth.uid, recipe.parentId));
+        if (!isOwner) {
+            throw new functions.https.HttpsError('permission-denied', 'You do not have permission to convert this recipe');
+        }
+        // Check cache first
+        const cacheKey = generateCacheKey(recipe.url || recipe.title, readingLevel, getAgeRange(kidAge), allergyFlags || [], 'beginner' // Default experience level for now
+        );
+        const cached = await checkConversionCache(cacheKey);
+        if (cached) {
+            console.log('Using cached conversion');
+            // Check for allergies in original recipe even when using cache
+            const allergyInfo = allergyFlags && allergyFlags.length > 0
+                ? detectAllergensInIngredients(recipe.ingredients || [], allergyFlags.map(allergen => ({ allergen, severity: 'moderate' })))
+                : { hasAllergens: false, detectedAllergens: [], warnings: [] };
+            const kidRecipeId = await createKidRecipeFromCache(recipeId, kidAge, readingLevel, cached, context.auth.uid);
+            // Update rate limit counter
+            await updateConversionCount(context.auth.uid);
+            return {
+                success: true,
+                kidRecipeId,
+                usedCache: true,
+                allergyWarnings: allergyInfo.warnings,
+                hasAllergens: allergyInfo.hasAllergens
+            };
+        }
+        // Check for allergies in original recipe
+        const allergyInfo = allergyFlags && allergyFlags.length > 0
+            ? detectAllergensInIngredients(recipe.ingredients || [], allergyFlags.map(allergen => ({ allergen, severity: 'moderate' })))
+            : { hasAllergens: false, detectedAllergens: [], warnings: [] };
+        // Convert with AI
+        console.log('Converting recipe with AI');
+        const conversion = await convertRecipeWithAI(recipe, kidAge, readingLevel, allergyFlags);
+        // Add allergy information to conversion
+        const enhancedConversion = Object.assign(Object.assign({}, conversion), { allergyInfo: allergyInfo });
+        // Store in cache
+        await storeConversionInCache(cacheKey, enhancedConversion, recipe.url || recipe.title);
+        // Create kid recipe
+        const kidRecipeId = await createKidRecipe(recipeId, kidAge, readingLevel, enhancedConversion, context.auth.uid);
+        // Update rate limit counter
+        await updateConversionCount(context.auth.uid);
+        return {
+            success: true,
+            kidRecipeId,
+            usedCache: false,
+            allergyWarnings: allergyInfo.warnings,
+            hasAllergens: allergyInfo.hasAllergens
+        };
+    }
+    catch (error) {
+        console.error('Error converting recipe:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', error instanceof Error ? error.message : 'Failed to convert recipe');
+    }
+});
+// HTTP endpoint for recipe import that handles React Native auth properly
+exports.importRecipeHttp = functions.https.onRequest(async (req, res) => {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o;
+    try {
+        // Set CORS headers
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Methods', 'POST');
+        res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        if (req.method === 'OPTIONS') {
+            res.status(204).send('');
+            return;
+        }
+        if (req.method !== 'POST') {
+            res.status(405).json({ error: 'Method not allowed' });
+            return;
+        }
+        // Get the authorization header
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            res.status(401).json({ error: 'Missing or invalid authorization header' });
+            return;
+        }
+        const token = authHeader.split('Bearer ')[1];
+        // Verify the Firebase token
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        console.log('Authenticated user:', decodedToken.uid, decodedToken.email);
+        const { url } = req.body;
+        if (!url) {
+            res.status(400).json({ error: 'URL is required' });
+            return;
+        }
+        if (!isValidUrl(url)) {
+            res.status(400).json({ error: 'Invalid URL format' });
+            return;
+        }
+        // Check rate limits
+        await checkImportRateLimit(decodedToken.uid);
+        // Check global recipe cache first
+        const cachedRecipe = await getRecipeFromCache(url);
+        let recipe;
+        if (cachedRecipe) {
+            console.log('Recipe found in cache:', url);
+            recipe = cachedRecipe;
+        }
+        else {
+            console.log('Recipe not in cache, scraping:', url);
+            // Extract recipe and cache it
+            recipe = await extractRecipeFromUrl(url);
+            await saveRecipeToCache(url, recipe);
+        }
+        // Server-side validation
+        await validateRecipeData(recipe);
+        // Update rate limit counter
+        await updateImportCount(decodedToken.uid);
+        // Return recipe data without saving to user collection
+        // The client (ImportContext) will handle saving to user's personal collection
+        res.json({
+            success: true,
+            recipe: recipe
+        });
+    }
+    catch (error) {
+        console.error('Error in importRecipeHttp:', error);
+        // Authentication errors
+        if (error.code === 'auth/id-token-expired' || error.code === 'auth/id-token-revoked') {
+            res.status(401).json({
+                error: 'Authentication expired',
+                message: 'Please log in again to continue importing recipes',
+                canRetry: false
+            });
+            return;
+        }
+        // Rate limiting errors
+        if (((_a = error.message) === null || _a === void 0 ? void 0 : _a.includes('rate limit')) || ((_b = error.message) === null || _b === void 0 ? void 0 : _b.includes('Daily import limit reached'))) {
+            res.status(429).json({
+                error: 'Rate limit exceeded',
+                message: error.message,
+                canRetry: false,
+                suggestion: 'Try again tomorrow or upgrade to premium'
+            });
+            return;
+        }
+        // Recipe validation and scraping errors
+        if (((_c = error.message) === null || _c === void 0 ? void 0 : _c.includes('Missing instructions from this recipe page')) ||
+            ((_d = error.message) === null || _d === void 0 ? void 0 : _d.includes('No cooking instructions found')) ||
+            ((_e = error.message) === null || _e === void 0 ? void 0 : _e.includes('This site might not expose steps properly'))) {
+            res.status(400).json({
+                error: 'Incomplete recipe data',
+                message: error.message,
+                canRetry: false,
+                allowManualEdit: true,
+                suggestion: 'This website didn\'t provide complete recipe instructions. Try a different recipe URL or enter the recipe manually.'
+            });
+            return;
+        }
+        if ((_f = error.message) === null || _f === void 0 ? void 0 : _f.includes('Recipe must have a title')) {
+            res.status(400).json({
+                error: 'Invalid recipe page',
+                message: 'No recipe found on this page',
+                canRetry: false,
+                allowManualEdit: true,
+                suggestion: 'Make sure the URL points to a recipe page, not a blog post or search results'
+            });
+            return;
+        }
+        if (((_g = error.message) === null || _g === void 0 ? void 0 : _g.includes('Missing ingredients from this recipe page')) ||
+            ((_h = error.message) === null || _h === void 0 ? void 0 : _h.includes('Recipe must have at least one ingredient')) ||
+            ((_j = error.message) === null || _j === void 0 ? void 0 : _j.includes('No valid ingredients found'))) {
+            res.status(400).json({
+                error: 'Missing ingredients',
+                message: 'No recipe ingredients found on this page',
+                canRetry: false,
+                allowManualEdit: true,
+                suggestion: 'This might not be a complete recipe page. Try a different URL or enter the recipe manually.'
+            });
+            return;
+        }
+        // Network and website errors
+        if ((_k = error.message) === null || _k === void 0 ? void 0 : _k.includes('Website not found')) {
+            res.status(404).json({
+                error: 'Website not found',
+                message: 'The website could not be reached',
+                canRetry: true,
+                suggestion: 'Check that the URL is correct and the website is online'
+            });
+            return;
+        }
+        if ((_l = error.message) === null || _l === void 0 ? void 0 : _l.includes('Recipe page not found')) {
+            res.status(404).json({
+                error: 'Page not found',
+                message: 'Recipe page not found',
+                canRetry: false,
+                suggestion: 'Check that the URL is correct and the page exists'
+            });
+            return;
+        }
+        if ((_m = error.message) === null || _m === void 0 ? void 0 : _m.includes('Request timed out')) {
+            res.status(408).json({
+                error: 'Timeout',
+                message: 'Import timed out - the website may be slow',
+                canRetry: true,
+                suggestion: 'Try again in a few minutes'
+            });
+            return;
+        }
+        if ((_o = error.message) === null || _o === void 0 ? void 0 : _o.includes('No recipe data found')) {
+            res.status(400).json({
+                error: 'No recipe found',
+                message: 'No recipe data found on this page',
+                canRetry: false,
+                allowManualEdit: true,
+                suggestion: 'Make sure the URL points to a recipe page with ingredients and instructions. You can also enter the recipe manually.'
+            });
+            return;
+        }
+        // Generic server errors
+        res.status(500).json({
+            error: 'Import failed',
+            message: 'Failed to import recipe',
+            canRetry: true,
+            allowManualEdit: true,
+            suggestion: 'Please try again or enter the recipe manually. Contact support if the problem persists.'
+        });
+    }
+});
+// Cloud Function to import recipes securely with rate limiting
+exports.importRecipeSecure = functions.https.onCall(async (data, context) => {
+    var _a, _b, _c;
+    try {
+        console.log('importRecipeSecure called with context:', {
+            authExists: !!context.auth,
+            uid: (_a = context.auth) === null || _a === void 0 ? void 0 : _a.uid,
+            email: (_c = (_b = context.auth) === null || _b === void 0 ? void 0 : _b.token) === null || _c === void 0 ? void 0 : _c.email,
+        });
+        // Authentication check
+        if (!context.auth) {
+            console.error('No auth context provided');
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const { url } = data;
+        if (!url) {
+            throw new functions.https.HttpsError('invalid-argument', 'URL is required');
+        }
+        if (!isValidUrl(url)) {
+            throw new functions.https.HttpsError('invalid-argument', 'Invalid URL format');
+        }
+        // Check rate limits
+        await checkImportRateLimit(context.auth.uid);
+        // Check global recipe cache first
+        const cachedRecipe = await getRecipeFromCache(url);
+        let recipe;
+        if (cachedRecipe) {
+            console.log('Recipe found in cache:', url);
+            recipe = cachedRecipe;
+        }
+        else {
+            console.log('Recipe not in cache, scraping:', url);
+            // Extract recipe and cache it
+            recipe = await extractRecipeFromUrl(url);
+            await saveRecipeToCache(url, recipe);
+        }
+        // Server-side validation
+        await validateRecipeData(recipe);
+        // Update rate limit counter
+        await updateImportCount(context.auth.uid);
+        // Return recipe data without saving to user collection
+        // The client (ImportContext) will handle saving to user's personal collection
+        return {
+            success: true,
+            recipe: recipe
+        };
+    }
+    catch (error) {
+        console.error('Error importing recipe:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', error instanceof Error ? error.message : 'Failed to import recipe');
+    }
+});
+// Helper functions
+async function checkConversionRateLimit(userId) {
+    const rateLimitDoc = await admin.firestore().collection('rateLimits').doc(userId).get();
+    const rateLimitData = rateLimitDoc.data();
+    const now = new Date();
+    const today = now.toDateString();
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+    if (!rateLimitData) {
+        // First time user, create rate limit doc
+        await admin.firestore().collection('rateLimits').doc(userId).set({
+            userId,
+            dailyImports: 0,
+            dailyConversions: 0,
+            lastResetDate: today,
+        });
+        return;
+    }
+    // Reset daily counters if new day
+    if (rateLimitData.lastResetDate !== today) {
+        await admin.firestore().collection('rateLimits').doc(userId).update({
+            dailyImports: 0,
+            dailyConversions: 0,
+            lastResetDate: today,
+        });
+        return;
+    }
+    // Check daily limit
+    if (rateLimitData.dailyConversions >= MAX_DAILY_CONVERSIONS) {
+        throw new functions.https.HttpsError('resource-exhausted', `Daily conversion limit reached (${MAX_DAILY_CONVERSIONS}/day). Please try again tomorrow.`);
+    }
+    // Check hourly limit
+    if (rateLimitData.lastConversionTimestamp) {
+        const lastConversion = rateLimitData.lastConversionTimestamp.toDate();
+        if (lastConversion > oneHourAgo) {
+            // Count conversions in last hour
+            try {
+                const conversionsInLastHour = await countRecentConversions(userId, oneHourAgo);
+                if (conversionsInLastHour >= MAX_CONVERSIONS_PER_HOUR) {
+                    throw new functions.https.HttpsError('resource-exhausted', `Hourly conversion limit reached (${MAX_CONVERSIONS_PER_HOUR}/hour). Please wait before converting more recipes.`);
+                }
+            }
+            catch (error) {
+                if ((error === null || error === void 0 ? void 0 : error.code) === 9) {
+                    console.warn('Conversion rate limit check skipped due to missing index:', error === null || error === void 0 ? void 0 : error.message);
+                }
+                else {
+                    throw error;
+                }
+            }
+        }
+    }
+}
+async function checkImportRateLimit(userId) {
+    const rateLimitDoc = await admin.firestore().collection('rateLimits').doc(userId).get();
+    const rateLimitData = rateLimitDoc.data();
+    const now = new Date();
+    const today = now.toDateString();
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+    if (!rateLimitData) {
+        await admin.firestore().collection('rateLimits').doc(userId).set({
+            userId,
+            dailyImports: 0,
+            dailyConversions: 0,
+            lastResetDate: today,
+        });
+        return;
+    }
+    if (rateLimitData.lastResetDate !== today) {
+        await admin.firestore().collection('rateLimits').doc(userId).update({
+            dailyImports: 0,
+            dailyConversions: 0,
+            lastResetDate: today,
+        });
+        return;
+    }
+    if (rateLimitData.dailyImports >= MAX_DAILY_IMPORTS) {
+        throw new functions.https.HttpsError('resource-exhausted', `Daily import limit reached (${MAX_DAILY_IMPORTS}/day). Please try again tomorrow.`);
+    }
+    if (rateLimitData.lastImportTimestamp) {
+        const lastImport = rateLimitData.lastImportTimestamp.toDate();
+        if (lastImport > oneHourAgo) {
+            try {
+                const importsInLastHour = await countRecentImports(userId, oneHourAgo);
+                if (importsInLastHour >= MAX_IMPORTS_PER_HOUR) {
+                    throw new functions.https.HttpsError('resource-exhausted', `Hourly import limit reached (${MAX_IMPORTS_PER_HOUR}/hour). Please wait before importing more recipes.`);
+                }
+            }
+            catch (error) {
+                if ((error === null || error === void 0 ? void 0 : error.code) === 9) {
+                    console.warn('Rate limit check skipped due to missing index:', error === null || error === void 0 ? void 0 : error.message);
+                }
+                else {
+                    throw error;
+                }
+            }
+        }
+    }
+}
+async function updateConversionCount(userId) {
+    await admin.firestore().collection('rateLimits').doc(userId).update({
+        dailyConversions: admin.firestore.FieldValue.increment(1),
+        lastConversionTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+}
+async function updateImportCount(userId) {
+    await admin.firestore().collection('rateLimits').doc(userId).update({
+        dailyImports: admin.firestore.FieldValue.increment(1),
+        lastImportTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+}
+async function countRecentConversions(userId, since) {
+    const query = await admin.firestore()
+        .collection('kidRecipes')
+        .where('userId', '==', userId)
+        .where('createdAt', '>', admin.firestore.Timestamp.fromDate(since))
+        .get();
+    return query.size;
+}
+async function countRecentImports(userId, since) {
+    const query = await admin.firestore()
+        .collection('recipes')
+        .where('userId', '==', userId)
+        .where('createdAt', '>', admin.firestore.Timestamp.fromDate(since))
+        .get();
+    return query.size;
+}
+async function isUserOwnerOfParentProfile(userId, parentId) {
+    var _a;
+    const parentDoc = await admin.firestore().collection('parentProfiles').doc(parentId).get();
+    return parentDoc.exists && ((_a = parentDoc.data()) === null || _a === void 0 ? void 0 : _a.userId) === userId;
+}
+async function getUserParentProfile(userId) {
+    const query = await admin.firestore()
+        .collection('parentProfiles')
+        .where('userId', '==', userId)
+        .limit(1)
+        .get();
+    return query.empty ? null : Object.assign({ id: query.docs[0].id }, query.docs[0].data());
+}
+async function createParentProfile(userId, email) {
+    console.log('Creating parent profile for user:', userId, email);
+    const parentProfileData = {
+        userId,
+        email,
+        name: email.split('@')[0],
+        pin: null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const docRef = await admin.firestore().collection('parentProfiles').add(parentProfileData);
+    console.log('Parent profile created with ID:', docRef.id);
+    return Object.assign({ id: docRef.id }, parentProfileData);
+}
+// Cloud Function to create and manage kid profiles
+exports.createKidProfile = functions.https.onCall(async (data, context) => {
+    var _a;
+    try {
+        // Authentication check
+        if (!context.auth) {
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const { name, age, readingLevel, allergies, experience = 'beginner' } = data;
+        // Input validation
+        if (!name || !age || !readingLevel) {
+            throw new functions.https.HttpsError('invalid-argument', 'Name, age, and reading level are required');
+        }
+        if (age < 3 || age > 18) {
+            throw new functions.https.HttpsError('invalid-argument', 'Kid age must be between 3 and 18');
+        }
+        if (!['beginner', 'intermediate', 'advanced'].includes(readingLevel)) {
+            throw new functions.https.HttpsError('invalid-argument', 'Invalid reading level');
+        }
+        // Get or create parent profile
+        let parentProfile = await getUserParentProfile(context.auth.uid);
+        if (!parentProfile) {
+            parentProfile = await createParentProfile(context.auth.uid, ((_a = context.auth.token) === null || _a === void 0 ? void 0 : _a.email) || `user_${context.auth.uid}`);
+        }
+        // Create kid profile
+        const kidProfileData = {
+            name: name.trim(),
+            age,
+            readingLevel,
+            allergies: allergies || [],
+            experience,
+            favoriteRecipes: [],
+            parentId: parentProfile.id,
+            userId: context.auth.uid,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            isActive: true,
+        };
+        const docRef = await admin.firestore().collection('kidProfiles').add(kidProfileData);
+        console.log('Kid profile created with ID:', docRef.id);
+        return {
+            success: true,
+            kidProfileId: docRef.id,
+            profile: Object.assign({ id: docRef.id }, kidProfileData)
+        };
+    }
+    catch (error) {
+        console.error('Error creating kid profile:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', error instanceof Error ? error.message : 'Failed to create kid profile');
+    }
+});
+// Cloud Function to get kid profile by ID
+exports.getKidProfileById = functions.https.onCall(async (data, context) => {
+    try {
+        // Authentication check
+        if (!context.auth) {
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const { kidProfileId } = data;
+        if (!kidProfileId) {
+            throw new functions.https.HttpsError('invalid-argument', 'Kid profile ID is required');
+        }
+        const profile = await getKidProfile(kidProfileId);
+        if (!profile) {
+            throw new functions.https.HttpsError('not-found', 'Kid profile not found');
+        }
+        // Verify user owns this profile
+        if (profile.userId !== context.auth.uid) {
+            throw new functions.https.HttpsError('permission-denied', 'You do not have permission to access this profile');
+        }
+        return {
+            success: true,
+            profile
+        };
+    }
+    catch (error) {
+        console.error('Error getting kid profile:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', error instanceof Error ? error.message : 'Failed to get kid profile');
+    }
+});
+// Helper function to get kid profile by ID
+async function getKidProfile(kidProfileId) {
+    const doc = await admin.firestore().collection('kidProfiles').doc(kidProfileId).get();
+    if (!doc.exists)
+        return null;
+    const data = doc.data();
+    return data ? Object.assign({ id: doc.id }, data) : null;
+}
+// Cloud Function to rate and provide feedback on kid recipes
+exports.rateKidRecipe = functions.https.onCall(async (data, context) => {
+    var _a;
+    try {
+        // Authentication check
+        if (!context.auth) {
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const { kidRecipeId, rating, feedback } = data;
+        // Validation
+        if (!kidRecipeId || rating == null) {
+            throw new functions.https.HttpsError('invalid-argument', 'Kid recipe ID and rating are required');
+        }
+        if (rating < 1 || rating > 5) {
+            throw new functions.https.HttpsError('invalid-argument', 'Rating must be between 1 and 5');
+        }
+        // Get the kid recipe
+        const kidRecipeDoc = await admin.firestore().collection('kidRecipes').doc(kidRecipeId).get();
+        if (!kidRecipeDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Kid recipe not found');
+        }
+        const kidRecipe = kidRecipeDoc.data();
+        if (!kidRecipe) {
+            throw new functions.https.HttpsError('internal', 'Kid recipe data is invalid');
+        }
+        // Verify user owns this recipe
+        if (kidRecipe.userId !== context.auth.uid) {
+            throw new functions.https.HttpsError('permission-denied', 'You do not have permission to rate this recipe');
+        }
+        // Update the kid recipe with rating and feedback
+        const updatedMetadata = Object.assign(Object.assign({}, kidRecipe.aiMetadata), { qualityScore: rating, parentFeedback: {
+                rating,
+                feedback: feedback || null,
+                submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+                userId: context.auth.uid
+            }, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+        await admin.firestore().collection('kidRecipes').doc(kidRecipeId).update({
+            aiMetadata: updatedMetadata,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        // Check if this is a low rating that needs refinement
+        const needsRefinement = rating < 3.5;
+        let refinementTriggered = false;
+        if (needsRefinement && ((_a = kidRecipe.aiMetadata) === null || _a === void 0 ? void 0 : _a.regenerationCount) < 2) {
+            try {
+                await triggerRecipeRefinement(kidRecipeId, kidRecipe, feedback);
+                refinementTriggered = true;
+            }
+            catch (error) {
+                console.error('Failed to trigger refinement:', error);
+                // Don't fail the rating if refinement fails
+            }
+        }
+        console.log(`Recipe ${kidRecipeId} rated ${rating}/5 by user ${context.auth.uid}`);
+        return {
+            success: true,
+            rating,
+            needsRefinement,
+            refinementTriggered,
+            message: needsRefinement
+                ? 'Thank you for your feedback! We\'ll work on improving this recipe.'
+                : 'Thank you for your rating!'
+        };
+    }
+    catch (error) {
+        console.error('Error rating kid recipe:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', error instanceof Error ? error.message : 'Failed to rate recipe');
+    }
+});
+// Function to trigger recipe refinement for low-rated recipes
+async function triggerRecipeRefinement(kidRecipeId, kidRecipe, feedback) {
+    var _a, _b;
+    try {
+        // Get the original recipe
+        const originalRecipeDoc = await admin.firestore().collection('recipes').doc(kidRecipe.originalRecipeId).get();
+        if (!originalRecipeDoc.exists) {
+            throw new Error('Original recipe not found');
+        }
+        const originalRecipe = originalRecipeDoc.data();
+        if (!originalRecipe) {
+            throw new Error('Original recipe data is invalid');
+        }
+        // Create refined prompt based on feedback
+        const refinementPrompt = createRefinementPrompt(originalRecipe, kidRecipe, feedback);
+        // Call AI for refinement
+        const refinedConversion = await refineRecipeWithAI(originalRecipe, kidRecipe.kidAge, kidRecipe.targetReadingLevel, refinementPrompt, ((_a = kidRecipe.aiMetadata) === null || _a === void 0 ? void 0 : _a.regenerationCount) || 0);
+        // Update the kid recipe with refined content
+        const updatedMetadata = Object.assign(Object.assign({}, kidRecipe.aiMetadata), { regenerationCount: (((_b = kidRecipe.aiMetadata) === null || _b === void 0 ? void 0 : _b.regenerationCount) || 0) + 1, lastRefinement: admin.firestore.FieldValue.serverTimestamp(), refinementReason: 'low_rating', parentFeedbackUsed: feedback || null });
+        await admin.firestore().collection('kidRecipes').doc(kidRecipeId).update({
+            simplifiedIngredients: refinedConversion.simplifiedIngredients,
+            simplifiedSteps: refinedConversion.simplifiedSteps,
+            safetyNotes: refinedConversion.safetyNotes,
+            estimatedDuration: refinedConversion.estimatedDuration,
+            skillsRequired: refinedConversion.skillsRequired,
+            aiMetadata: updatedMetadata,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`Recipe ${kidRecipeId} refined due to low rating`);
+    }
+    catch (error) {
+        console.error('Error in triggerRecipeRefinement:', error);
+        throw error;
+    }
+}
+// Create a refinement prompt based on parent feedback
+function createRefinementPrompt(originalRecipe, kidRecipe, feedback) {
+    let refinementInstructions = `The parent rated this conversion poorly (below 3.5/5). Please improve it based on the following feedback:\n\n`;
+    if ((feedback === null || feedback === void 0 ? void 0 : feedback.unclearSteps) && feedback.unclearSteps.length > 0) {
+        refinementInstructions += `UNCLEAR STEPS (need simplification): Steps ${feedback.unclearSteps.join(', ')}\n`;
+    }
+    if (feedback === null || feedback === void 0 ? void 0 : feedback.suggestions) {
+        refinementInstructions += `PARENT SUGGESTIONS: ${feedback.suggestions}\n`;
+    }
+    if (feedback === null || feedback === void 0 ? void 0 : feedback.safetyNotes) {
+        refinementInstructions += `SAFETY CONCERNS: ${feedback.safetyNotes}\n`;
+    }
+    if (feedback === null || feedback === void 0 ? void 0 : feedback.overallComments) {
+        refinementInstructions += `GENERAL FEEDBACK: ${feedback.overallComments}\n`;
+    }
+    refinementInstructions += `\nPlease focus on making the instructions clearer, more age-appropriate, and safer. Make sure each step is simple and easy to understand for a ${kidRecipe.kidAge}-year-old.`;
+    return refinementInstructions;
+}
+// AI refinement function with enhanced prompting
+async function refineRecipeWithAI(recipe, kidAge, readingLevel, refinementInstructions, regenerationCount) {
+    var _a, _b, _c, _d, _e;
+    try {
+        const apiKey = ((_a = functions.config().openai) === null || _a === void 0 ? void 0 : _a.api_key) || process.env.OPENAI_API_KEY;
+        if (!apiKey) {
+            throw new Error('OpenAI API key not configured');
+        }
+        const prompt = `RECIPE REFINEMENT REQUEST (Attempt ${regenerationCount + 1})
+
+${refinementInstructions}
+
+Original Recipe:
+Title: ${recipe.title}
+Ingredients: ${((_b = recipe.ingredients) === null || _b === void 0 ? void 0 : _b.join(', ')) || 'Not specified'}
+Instructions: ${((_c = recipe.instructions) === null || _c === void 0 ? void 0 : _c.join(' ')) || 'Not specified'}
+
+Please convert this recipe to be kid-friendly for a ${kidAge}-year-old with ${readingLevel} reading level, incorporating the feedback above.
+
+Return a JSON object with:
+{
+  "simplifiedIngredients": ["array of simple ingredient descriptions"],
+  "simplifiedSteps": [
+    {
+      "step": "Clear, simple instruction",
+      "icon": "🔥 or 🥄 or ⏰ etc",
+      "time": "estimated time in minutes",
+      "difficulty": "easy/medium/hard",
+      "safetyTip": "any safety note for this step",
+      "order": 1
+    }
+  ],
+  "safetyNotes": ["Important safety reminders for kids"],
+  "estimatedDuration": "total time estimate",
+  "skillsRequired": ["basic skills needed"]
+}`;
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a culinary instructor specializing in kid-safe cooking. You excel at creating clear, age-appropriate instructions and incorporating parent feedback to improve recipe clarity and safety.'
+                },
+                {
+                    role: 'user',
+                    content: prompt
+                }
+            ],
+            temperature: 0.4,
+            max_tokens: 4000,
+        });
+        const rawContent = (_e = (_d = response.choices[0]) === null || _d === void 0 ? void 0 : _d.message) === null || _e === void 0 ? void 0 : _e.content;
+        if (!rawContent) {
+            throw new Error('No response from OpenAI refinement');
+        }
+        // Clean up the response content - remove any markdown formatting and comments
+        let cleanContent = rawContent
+            .replace(/```json\s*/g, '') // Remove ```json
+            .replace(/```\s*/g, '') // Remove ending ```
+            .replace(/\/\/.*$/gm, '') // Remove single-line comments
+            .replace(/\/\*[\s\S]*?\*\//g, '') // Remove multi-line comments
+            .trim();
+        // Replace common Unicode fractions with decimal numbers
+        const fractionReplacements = {
+            '½': '0.5',
+            '⅓': '0.33',
+            '⅔': '0.67',
+            '¼': '0.25',
+            '¾': '0.75',
+            '⅕': '0.2',
+            '⅖': '0.4',
+            '⅗': '0.6',
+            '⅘': '0.8',
+            '⅙': '0.17',
+            '⅚': '0.83',
+            '⅛': '0.125',
+            '⅜': '0.375',
+            '⅝': '0.625',
+            '⅞': '0.875'
+        };
+        for (const [fraction, decimal] of Object.entries(fractionReplacements)) {
+            cleanContent = cleanContent.replace(new RegExp(fraction, 'g'), decimal);
+        }
+        // Find JSON content if it's wrapped in text
+        const jsonStart = cleanContent.indexOf('{');
+        const jsonEnd = cleanContent.lastIndexOf('}') + 1;
+        if (jsonStart !== -1 && jsonEnd > jsonStart) {
+            cleanContent = cleanContent.substring(jsonStart, jsonEnd);
+        }
+        // Parse and validate refined response
+        let parsed;
+        try {
+            parsed = JSON.parse(cleanContent);
+        }
+        catch (parseError) {
+            console.error('Failed to parse OpenAI JSON response:', parseError);
+            console.error('Raw content:', rawContent);
+            console.error('Clean content:', cleanContent);
+            throw new Error(`Invalid JSON response from OpenAI refinement: ${parseError instanceof Error ? parseError.message : 'Unknown parsing error'}`);
+        }
+        return validateAIResponse(parsed);
+    }
+    catch (error) {
+        console.error('OpenAI refinement error:', error);
+        throw new Error('Failed to refine recipe with AI: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+}
+// Common allergens database for detection
+const COMMON_ALLERGENS = {
+    'nuts': [
+        'almond', 'almonds', 'walnut', 'walnuts', 'pecan', 'pecans', 'cashew', 'cashews',
+        'pistachio', 'pistachios', 'hazelnut', 'hazelnuts', 'macadamia', 'brazil nut',
+        'pine nut', 'pine nuts', 'chestnut', 'chestnuts', 'nut', 'nuts', 'tree nut',
+        'peanut', 'peanuts', 'peanut butter', 'nutella'
+    ],
+    'dairy': [
+        'milk', 'butter', 'cheese', 'cream', 'yogurt', 'yoghurt', 'sour cream',
+        'heavy cream', 'whipped cream', 'cottage cheese', 'cream cheese', 'mozzarella',
+        'cheddar', 'parmesan', 'swiss cheese', 'goat cheese', 'feta', 'ricotta',
+        'buttermilk', 'half and half', 'dairy', 'lactose', 'casein', 'whey'
+    ],
+    'eggs': [
+        'egg', 'eggs', 'egg white', 'egg whites', 'egg yolk', 'egg yolks',
+        'whole egg', 'beaten egg', 'scrambled egg', 'mayonnaise', 'mayo'
+    ],
+    'shellfish': [
+        'shrimp', 'crab', 'lobster', 'crawfish', 'crayfish', 'prawn', 'prawns',
+        'scallop', 'scallops', 'clam', 'clams', 'oyster', 'oysters', 'mussel', 'mussels',
+        'shellfish', 'seafood'
+    ],
+    'fish': [
+        'salmon', 'tuna', 'cod', 'halibut', 'trout', 'bass', 'mackerel', 'sardine',
+        'sardines', 'anchovy', 'anchovies', 'fish', 'fish sauce', 'worcestershire'
+    ],
+    'soy': [
+        'soy', 'soy sauce', 'soy milk', 'tofu', 'tempeh', 'miso', 'edamame',
+        'soybean', 'soybeans', 'soy protein', 'soy lecithin'
+    ],
+    'wheat': [
+        'wheat', 'flour', 'bread', 'pasta', 'noodles', 'crackers', 'cereal',
+        'wheat flour', 'all-purpose flour', 'whole wheat', 'breadcrumbs', 'gluten',
+        'semolina', 'durum', 'bulgur', 'couscous'
+    ],
+    'sesame': [
+        'sesame', 'sesame seed', 'sesame seeds', 'sesame oil', 'tahini',
+        'sesame paste', 'sesame butter'
+    ]
+};
+// Function to detect allergens in ingredients
+function detectAllergensInIngredients(ingredients, allergies) {
+    const detected = [];
+    const warnings = [];
+    // Check each allergy against all ingredients
+    for (const allergy of allergies) {
+        const allergenName = allergy.allergen.toLowerCase();
+        const allergenKeywords = COMMON_ALLERGENS[allergenName] || [allergenName];
+        const foundInIngredients = [];
+        for (const ingredient of ingredients) {
+            const ingredientLower = ingredient.toLowerCase();
+            // Check for exact matches and partial matches
+            for (const keyword of allergenKeywords) {
+                if (ingredientLower.includes(keyword)) {
+                    foundInIngredients.push(ingredient);
+                    break; // Don't add same ingredient multiple times
+                }
+            }
+        }
+        if (foundInIngredients.length > 0) {
+            detected.push({
+                allergen: allergy.allergen,
+                severity: allergy.severity,
+                foundIn: foundInIngredients,
+                confidence: 'high' // For now, assume high confidence for direct matches
+            });
+            // Generate warning messages based on severity
+            const ingredientList = foundInIngredients.join(', ');
+            switch (allergy.severity) {
+                case 'severe':
+                    warnings.push(`⚠️ SEVERE ALLERGY WARNING: Contains ${allergy.allergen} in: ${ingredientList}`);
+                    break;
+                case 'moderate':
+                    warnings.push(`⚠️ ALLERGY ALERT: Contains ${allergy.allergen} in: ${ingredientList}`);
+                    break;
+                case 'mild':
+                    warnings.push(`⚠️ Contains ${allergy.allergen} in: ${ingredientList}`);
+                    break;
+            }
+        }
+    }
+    return {
+        hasAllergens: detected.length > 0,
+        detectedAllergens: detected,
+        warnings
+    };
+}
+function generateCacheKey(url, readingLevel, ageRange, allergyProfile = [], experience = 'beginner') {
+    // Create a consistent string for hashing
+    const normalizedUrl = url.toLowerCase().trim();
+    const sortedAllergies = [...allergyProfile].sort().join(',');
+    const cacheInput = `${normalizedUrl}|${readingLevel}|${ageRange}|${sortedAllergies}|${experience}`;
+    // Generate SHA256 hash
+    const hash = crypto.createHash('sha256').update(cacheInput).digest('hex');
+    // Use first 16 characters for readability while maintaining uniqueness
+    return `recipe_${hash.substring(0, 16)}`;
+}
+function getAgeRange(age) {
+    if (age <= 6)
+        return '3-6';
+    if (age <= 10)
+        return '7-10';
+    if (age <= 14)
+        return '11-14';
+    return '15-18';
+}
+async function checkConversionCache(cacheKey) {
+    var _a;
+    const cacheDoc = await admin.firestore().collection('kidRecipeCache').doc(cacheKey).get();
+    if (!cacheDoc.exists)
+        return null;
+    const data = cacheDoc.data();
+    // Check if cache is still fresh (30 days)
+    const createdAt = (_a = data === null || data === void 0 ? void 0 : data.createdAt) === null || _a === void 0 ? void 0 : _a.toDate();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    if (!createdAt || createdAt < thirtyDaysAgo) {
+        return null; // Cache expired
+    }
+    return data;
+}
+async function storeConversionInCache(cacheKey, conversion, sourceUrl) {
+    await admin.firestore().collection('kidRecipeCache').doc(cacheKey).set({
+        sourceUrl,
+        simplifiedIngredients: conversion.simplifiedIngredients,
+        simplifiedSteps: conversion.simplifiedSteps,
+        safetyNotes: conversion.safetyNotes,
+        estimatedDuration: conversion.estimatedDuration,
+        skillsRequired: conversion.skillsRequired,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        // AI Conversion Metadata for cache
+        aiMetadata: {
+            version: '1.0',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            qualityScore: 5.0,
+            generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            regenerationCount: 0
+        }
+    });
+}
+async function createKidRecipeFromCache(recipeId, kidAge, readingLevel, cached, userId) {
+    var _a, _b, _c, _d, _e;
+    const kidRecipeData = {
+        originalRecipeId: recipeId,
+        userId,
+        kidAge,
+        targetReadingLevel: readingLevel,
+        simplifiedIngredients: cached.simplifiedIngredients,
+        simplifiedSteps: cached.simplifiedSteps,
+        safetyNotes: cached.safetyNotes,
+        estimatedDuration: cached.estimatedDuration,
+        skillsRequired: cached.skillsRequired,
+        conversionCount: 1,
+        isActive: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        // Allergy information (if available)
+        allergyInfo: cached.allergyInfo || null,
+        // AI Conversion Metadata (from cache)
+        aiMetadata: {
+            version: ((_a = cached.aiMetadata) === null || _a === void 0 ? void 0 : _a.version) || '1.0',
+            provider: ((_b = cached.aiMetadata) === null || _b === void 0 ? void 0 : _b.provider) || 'openai',
+            model: ((_c = cached.aiMetadata) === null || _c === void 0 ? void 0 : _c.model) || 'gpt-4o-mini',
+            qualityScore: ((_d = cached.aiMetadata) === null || _d === void 0 ? void 0 : _d.qualityScore) || 5.0,
+            generatedAt: ((_e = cached.aiMetadata) === null || _e === void 0 ? void 0 : _e.generatedAt) || cached.createdAt,
+            parentFeedback: null,
+            regenerationCount: 0,
+            cacheSource: 'cached',
+            originalCacheTimestamp: cached.createdAt
+        }
+    };
+    const doc = await admin.firestore().collection('kidRecipes').add(kidRecipeData);
+    return doc.id;
+}
+async function convertRecipeWithAI(recipe, kidAge, readingLevel, allergyFlags) {
+    var _a, _b;
+    const prompt = `Convert this recipe to be kid-friendly for a ${kidAge}-year-old with ${readingLevel} reading level.
+
+Original Recipe:
+Title: ${recipe.title}
+Ingredients: ${JSON.stringify(recipe.ingredients)}
+Instructions: ${JSON.stringify(recipe.instructions || recipe.steps)}
+
+${allergyFlags.length > 0 ? `IMPORTANT: This child has allergies to: ${allergyFlags.join(', ')}. Please flag or suggest substitutions for any ingredients that contain these allergens.` : ''}
+
+SAFETY GUIDELINES:
+- If ingredients include alcohol (wine, beer, etc.), clearly mark steps that involve alcohol as "Ask an adult to help" and explain the alcohol will cook out
+- For sharp tools (knives, mandoline, etc.), mark as adult supervision required
+- For high heat/dangerous techniques (deep frying, broiling, etc.), emphasize adult assistance
+- For raw ingredients (raw eggs, undercooked meat), include proper handling safety notes
+- Always prioritize safety while keeping the recipe engaging for kids
+
+Please convert this to:
+1. Kid-friendly ingredient names and measurements they can understand
+2. Simple, clear step-by-step instructions appropriate for their reading level
+3. Clear safety notes and "ask an adult" reminders for dangerous steps
+4. Encouragement and positive language
+5. Estimated time for each step if relevant
+6. Adult supervision flags for unsafe elements
+
+Return the response as JSON in this exact format:
+{
+  "simplifiedIngredients": [
+    {
+      "id": "1",
+      "name": "original ingredient name",
+      "kidFriendlyName": "kid-friendly name",
+      "amount": 1,
+      "unit": "cup",
+      "description": "helpful description",
+      "order": 1
+    }
+  ],
+  "simplifiedSteps": [
+    {
+      "id": "1",
+      "step": "original step",
+      "kidFriendlyText": "simple kid-friendly instruction",
+      "safetyNote": "safety warning if needed",
+      "adultSupervision": true,
+      "time": "5 minutes",
+      "order": 1,
+      "completed": false,
+      "difficulty": "easy",
+      "encouragement": "Great job!"
+    }
+  ],
+  "safetyNotes": ["Important safety reminders"],
+  "estimatedDuration": 30,
+  "skillsRequired": ["mixing", "measuring"]
+}`;
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a helpful cooking instructor who specializes in teaching children how to cook safely. Always prioritize safety and age-appropriate instructions.'
+                },
+                {
+                    role: 'user',
+                    content: prompt
+                }
+            ],
+            temperature: 0.3,
+            max_tokens: 4000,
+        });
+        const rawContent = (_b = (_a = response.choices[0]) === null || _a === void 0 ? void 0 : _a.message) === null || _b === void 0 ? void 0 : _b.content;
+        if (!rawContent) {
+            throw new Error('No response from OpenAI');
+        }
+        // Clean up the response content - remove any markdown formatting and comments
+        let cleanContent = rawContent
+            .replace(/```json\s*/g, '') // Remove ```json
+            .replace(/```\s*/g, '') // Remove ending ```
+            .replace(/\/\/.*$/gm, '') // Remove single-line comments
+            .replace(/\/\*[\s\S]*?\*\//g, '') // Remove multi-line comments
+            .trim();
+        // Replace common Unicode fractions with decimal numbers
+        const fractionReplacements = {
+            '½': '0.5',
+            '⅓': '0.33',
+            '⅔': '0.67',
+            '¼': '0.25',
+            '¾': '0.75',
+            '⅕': '0.2',
+            '⅖': '0.4',
+            '⅗': '0.6',
+            '⅘': '0.8',
+            '⅙': '0.17',
+            '⅚': '0.83',
+            '⅛': '0.125',
+            '⅜': '0.375',
+            '⅝': '0.625',
+            '⅞': '0.875'
+        };
+        for (const [fraction, decimal] of Object.entries(fractionReplacements)) {
+            cleanContent = cleanContent.replace(new RegExp(fraction, 'g'), decimal);
+        }
+        // Find JSON content if it's wrapped in text
+        const jsonStart = cleanContent.indexOf('{');
+        const jsonEnd = cleanContent.lastIndexOf('}') + 1;
+        if (jsonStart !== -1 && jsonEnd > jsonStart) {
+            cleanContent = cleanContent.substring(jsonStart, jsonEnd);
+        }
+        // Parse JSON response
+        let parsed;
+        try {
+            parsed = JSON.parse(cleanContent);
+        }
+        catch (parseError) {
+            console.error('Failed to parse OpenAI JSON response:', parseError);
+            console.error('Raw content:', rawContent);
+            console.error('Clean content:', cleanContent);
+            throw new Error(`Invalid JSON response from OpenAI: ${parseError instanceof Error ? parseError.message : 'Unknown parsing error'}`);
+        }
+        return validateAIResponse(parsed);
+    }
+    catch (error) {
+        console.error('OpenAI conversion error:', error);
+        throw new Error('Failed to convert recipe with AI: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+}
+async function createKidRecipe(recipeId, kidAge, readingLevel, conversion, userId) {
+    const kidRecipeData = {
+        originalRecipeId: recipeId,
+        userId,
+        kidAge,
+        targetReadingLevel: readingLevel,
+        simplifiedIngredients: conversion.simplifiedIngredients,
+        simplifiedSteps: conversion.simplifiedSteps,
+        safetyNotes: conversion.safetyNotes,
+        estimatedDuration: conversion.estimatedDuration,
+        skillsRequired: conversion.skillsRequired,
+        conversionCount: 1,
+        isActive: true,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        // Allergy information (if provided)
+        allergyInfo: conversion.allergyInfo || null,
+        // AI Conversion Metadata
+        aiMetadata: {
+            version: '1.0',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            qualityScore: 5.0,
+            generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            parentFeedback: null,
+            regenerationCount: 0,
+            cacheSource: 'fresh' // Indicates this was freshly generated, not from cache
+        }
+    };
+    const doc = await admin.firestore().collection('kidRecipes').add(kidRecipeData);
+    return doc.id;
+}
+async function validateRecipeData(recipe) {
+    // Check required fields
+    if (!recipe.title || recipe.title.trim().length === 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'Recipe must have a title');
+    }
+    if (!recipe.ingredients || recipe.ingredients.length === 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'Missing ingredients from this recipe page');
+    }
+    if (!recipe.instructions || recipe.instructions.length === 0) {
+        throw new functions.https.HttpsError('invalid-argument', 'Missing instructions from this recipe page');
+    }
+    // Check size limits
+    if (recipe.title.length > 200) {
+        throw new functions.https.HttpsError('invalid-argument', 'Recipe title too long (max 200 characters)');
+    }
+    if (recipe.ingredients.length > 50) {
+        throw new functions.https.HttpsError('invalid-argument', 'Too many ingredients (max 50)');
+    }
+    if (recipe.instructions.length > 50) {
+        throw new functions.https.HttpsError('invalid-argument', 'Too many instructions (max 50)');
+    }
+    // Note: No content filtering at import - parents can import any recipe
+    // Safety checks happen when sharing with kids, not at import
+    // Sanitize strings to prevent XSS
+    recipe.title = sanitizeString(recipe.title);
+    recipe.ingredients = recipe.ingredients.map(sanitizeString);
+    recipe.instructions = recipe.instructions.map(sanitizeString);
+    if (recipe.description) {
+        recipe.description = sanitizeString(recipe.description);
+    }
+}
+function sanitizeString(str) {
+    return str.replace(/[<>]/g, '').trim();
+}
+function validateAIResponse(response) {
+    if (!response.simplifiedIngredients || !Array.isArray(response.simplifiedIngredients)) {
+        throw new Error('Invalid AI response: missing or invalid simplifiedIngredients');
+    }
+    if (!response.simplifiedSteps || !Array.isArray(response.simplifiedSteps)) {
+        throw new Error('Invalid AI response: missing or invalid simplifiedSteps');
+    }
+    if (!response.safetyNotes || !Array.isArray(response.safetyNotes)) {
+        throw new Error('Invalid AI response: missing or invalid safetyNotes');
+    }
+    // Ensure required fields in ingredients
+    response.simplifiedIngredients.forEach((ing, index) => {
+        if (!ing.id || !ing.name || !ing.kidFriendlyName) {
+            throw new Error(`Invalid ingredient at index ${index}: missing required fields`);
+        }
+        ing.order = ing.order || index + 1;
+    });
+    // Ensure required fields in steps
+    response.simplifiedSteps.forEach((step, index) => {
+        if (!step.id || !step.step || !step.kidFriendlyText) {
+            throw new Error(`Invalid step at index ${index}: missing required fields`);
+        }
+        step.order = step.order || index + 1;
+        step.completed = false; // Always start with incomplete steps
+        step.difficulty = step.difficulty || 'easy';
+    });
+    return response;
+}
+exports.reportUnclearStep = functions.https.onCall(async (data, context) => {
+    var _a, _b, _c;
+    if (!((_a = context.auth) === null || _a === void 0 ? void 0 : _a.uid)) {
+        throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+    }
+    const { kidRecipeId, stepIndex, kidId, issue, suggestion } = data;
+    if (!kidRecipeId || stepIndex === undefined || !kidId) {
+        throw new functions.https.HttpsError('invalid-argument', 'Missing required fields: kidRecipeId, stepIndex, kidId');
+    }
+    try {
+        const kidRecipeRef = admin.firestore().collection('kidRecipes').doc(kidRecipeId);
+        const kidRecipeDoc = await kidRecipeRef.get();
+        if (!kidRecipeDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Kid recipe not found');
+        }
+        const kidRecipe = kidRecipeDoc.data();
+        if (!kidRecipe) {
+            throw new functions.https.HttpsError('internal', 'Failed to load recipe data');
+        }
+        // Verify the step exists
+        if (!kidRecipe.simplifiedSteps || stepIndex >= kidRecipe.simplifiedSteps.length) {
+            throw new functions.https.HttpsError('invalid-argument', 'Invalid step index');
+        }
+        // Create step report document
+        const reportData = {
+            kidRecipeId,
+            originalRecipeId: kidRecipe.originalRecipeId,
+            stepIndex,
+            stepText: ((_b = kidRecipe.simplifiedSteps[stepIndex]) === null || _b === void 0 ? void 0 : _b.kidFriendlyText) || '',
+            originalStepText: ((_c = kidRecipe.simplifiedSteps[stepIndex]) === null || _c === void 0 ? void 0 : _c.step) || '',
+            kidId,
+            parentId: context.auth.uid,
+            issue: issue || 'unclear',
+            suggestion: suggestion || '',
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            status: 'pending',
+            reportType: 'unclear_step'
+        };
+        // Save the report
+        const reportRef = await admin.firestore().collection('stepReports').add(reportData);
+        // Update recipe metadata to track reports
+        const currentReports = kidRecipe.reportedSteps || [];
+        if (!currentReports.includes(stepIndex)) {
+            await kidRecipeRef.update({
+                reportedSteps: admin.firestore.FieldValue.arrayUnion(stepIndex),
+                lastReportedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+        // Check if this step has been reported multiple times (could trigger refinement)
+        const reportsForThisStep = await admin.firestore()
+            .collection('stepReports')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .where('stepIndex', '==', stepIndex)
+            .get();
+        let shouldTriggerRefinement = false;
+        if (reportsForThisStep.size >= 2) { // Multiple reports for same step
+            shouldTriggerRefinement = true;
+        }
+        // If this step has been reported multiple times, trigger automatic refinement
+        if (shouldTriggerRefinement) {
+            try {
+                console.log(`Step ${stepIndex} has ${reportsForThisStep.size} reports, triggering refinement...`);
+                // Collect all feedback for this step
+                const stepFeedback = reportsForThisStep.docs.map((doc) => {
+                    const data = doc.data();
+                    return {
+                        issue: data.issue,
+                        suggestion: data.suggestion,
+                        timestamp: data.timestamp
+                    };
+                });
+                await triggerStepRefinement(kidRecipeId, stepIndex, stepFeedback);
+            }
+            catch (refinementError) {
+                console.error('Failed to trigger step refinement:', refinementError);
+                // Don't fail the report if refinement fails
+            }
+        }
+        return {
+            success: true,
+            reportId: reportRef.id,
+            message: 'Thank you for letting us know! We\'ll work on making this step clearer.',
+            refinementTriggered: shouldTriggerRefinement
+        };
+    }
+    catch (error) {
+        console.error('Error reporting unclear step:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', 'Failed to report step issue');
+    }
+});
+async function triggerStepRefinement(kidRecipeId, stepIndex, feedback) {
+    var _a, _b, _c;
+    try {
+        const kidRecipeRef = admin.firestore().collection('kidRecipes').doc(kidRecipeId);
+        const kidRecipeDoc = await kidRecipeRef.get();
+        if (!kidRecipeDoc.exists) {
+            throw new Error('Kid recipe not found');
+        }
+        const kidRecipe = kidRecipeDoc.data();
+        if (!kidRecipe) {
+            throw new Error('Failed to load kid recipe data');
+        }
+        const step = kidRecipe.simplifiedSteps[stepIndex];
+        if (!step) {
+            throw new Error('Step not found');
+        }
+        // Prepare feedback summary for AI
+        const feedbackSummary = feedback.map(f => `Issue: ${f.issue || 'unclear'}, Suggestion: ${f.suggestion || 'none'}`).join('\n');
+        const refinementPrompt = `
+Please improve this cooking step for children based on the reported issues:
+
+Current step: "${step.kidFriendlyText}"
+Original step: "${step.step}"
+Age group: ${kidRecipe.targetAge || 8}-12 years
+Reading level: ${kidRecipe.readingLevel || 'beginner'}
+
+Reported issues:
+${feedbackSummary}
+
+Requirements:
+- Make the language even simpler and clearer
+- Break down complex actions into smaller parts
+- Add specific details that might be missing
+- Ensure safety is clearly communicated
+- Keep it encouraging and fun
+- Use kid-friendly vocabulary
+
+Respond with only the improved step text, nothing else.
+    `.trim();
+        const openai = new openai_1.default({
+            apiKey: process.env.OPENAI_API_KEY
+        });
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4',
+            messages: [{ role: 'user', content: refinementPrompt }],
+            max_tokens: 200,
+            temperature: 0.7
+        });
+        const improvedStepText = (_c = (_b = (_a = completion.choices[0]) === null || _a === void 0 ? void 0 : _a.message) === null || _b === void 0 ? void 0 : _b.content) === null || _c === void 0 ? void 0 : _c.trim();
+        if (!improvedStepText) {
+            throw new Error('Failed to generate improved step text');
+        }
+        // Update the step with improved text
+        const updatedSteps = [...kidRecipe.simplifiedSteps];
+        updatedSteps[stepIndex] = Object.assign(Object.assign({}, step), { kidFriendlyText: improvedStepText, lastRefinedAt: admin.firestore.FieldValue.serverTimestamp(), refinementCount: (step.refinementCount || 0) + 1 });
+        await kidRecipeRef.update({
+            simplifiedSteps: updatedSteps,
+            lastStepRefinedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        // Mark all reports for this step as resolved
+        const reportsBatch = admin.firestore().batch();
+        const reportsQuery = await admin.firestore()
+            .collection('stepReports')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .where('stepIndex', '==', stepIndex)
+            .where('status', '==', 'pending')
+            .get();
+        reportsQuery.docs.forEach((doc) => {
+            reportsBatch.update(doc.ref, {
+                status: 'resolved',
+                resolvedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        });
+        await reportsBatch.commit();
+        console.log(`Successfully refined step ${stepIndex} for recipe ${kidRecipeId}`);
+    }
+    catch (error) {
+        console.error('Error in triggerStepRefinement:', error);
+        throw error;
+    }
+}
+exports.getQualityAnalytics = functions.https.onCall(async (data, context) => {
+    var _a;
+    if (!((_a = context.auth) === null || _a === void 0 ? void 0 : _a.uid)) {
+        throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+    }
+    const { parentId, timeRange = 'month' } = data;
+    const userId = parentId || context.auth.uid;
+    try {
+        // Calculate time boundaries
+        const now = new Date();
+        let startDate;
+        switch (timeRange) {
+            case 'week':
+                startDate = new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+                break;
+            case 'month':
+                startDate = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
+                break;
+            case 'quarter':
+                startDate = new Date(now.getTime() - (90 * 24 * 60 * 60 * 1000));
+                break;
+            case 'year':
+                startDate = new Date(now.getTime() - (365 * 24 * 60 * 60 * 1000));
+                break;
+            default:
+                startDate = new Date(now.getTime() - (30 * 24 * 60 * 60 * 1000));
+        }
+        // Get all kid recipes for this parent
+        const kidRecipesQuery = await admin.firestore()
+            .collection('kidRecipes')
+            .where('parentId', '==', userId)
+            .get();
+        const kidRecipeIds = kidRecipesQuery.docs.map(doc => doc.id);
+        if (kidRecipeIds.length === 0) {
+            return {
+                success: true,
+                analytics: {
+                    totalRecipes: 0,
+                    averageRating: 0,
+                    totalRatings: 0,
+                    totalStepReports: 0,
+                    improvementRate: 0,
+                    qualityTrends: [],
+                    topIssues: [],
+                    recipeQualityBreakdown: []
+                }
+            };
+        }
+        // Get ratings within time range
+        const ratingsQuery = await admin.firestore()
+            .collection('kidRecipeRatings')
+            .where('kidRecipeId', 'in', kidRecipeIds.slice(0, 10)) // Firestore limit
+            .where('timestamp', '>=', admin.firestore.Timestamp.fromDate(startDate))
+            .get();
+        // Get step reports within time range
+        const reportsQuery = await admin.firestore()
+            .collection('stepReports')
+            .where('kidRecipeId', 'in', kidRecipeIds.slice(0, 10))
+            .where('timestamp', '>=', admin.firestore.Timestamp.fromDate(startDate))
+            .get();
+        // Calculate metrics
+        const ratings = ratingsQuery.docs.map(doc => doc.data());
+        const reports = reportsQuery.docs.map(doc => doc.data());
+        const totalRecipes = kidRecipeIds.length;
+        const totalRatings = ratings.length;
+        const averageRating = totalRatings > 0
+            ? ratings.reduce((sum, r) => sum + r.rating, 0) / totalRatings
+            : 0;
+        const totalStepReports = reports.length;
+        const resolvedReports = reports.filter(r => r.status === 'resolved').length;
+        const improvementRate = totalStepReports > 0 ? (resolvedReports / totalStepReports) * 100 : 0;
+        // Group issues by type
+        const issueCount = {};
+        reports.forEach(report => {
+            const issue = report.issue || 'unclear';
+            issueCount[issue] = (issueCount[issue] || 0) + 1;
+        });
+        const topIssues = Object.entries(issueCount)
+            .map(([issue, count]) => ({ issue, count }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 5);
+        // Calculate quality trends (weekly buckets)
+        const weeklyData = {};
+        const addToWeekly = (date, type, value) => {
+            const weekStart = new Date(date);
+            weekStart.setDate(date.getDate() - date.getDay()); // Start of week
+            const weekKey = weekStart.toISOString().split('T')[0];
+            if (!weeklyData[weekKey]) {
+                weeklyData[weekKey] = { ratings: [], reports: 0 };
+            }
+            if (type === 'rating' && value !== undefined) {
+                weeklyData[weekKey].ratings.push(value);
+            }
+            else if (type === 'report') {
+                weeklyData[weekKey].reports++;
+            }
+        };
+        ratings.forEach(rating => {
+            if (rating.timestamp) {
+                addToWeekly(rating.timestamp.toDate(), 'rating', rating.rating);
+            }
+        });
+        reports.forEach(report => {
+            if (report.timestamp) {
+                addToWeekly(report.timestamp.toDate(), 'report');
+            }
+        });
+        const qualityTrends = Object.entries(weeklyData)
+            .map(([week, data]) => ({
+            week,
+            averageRating: data.ratings.length > 0
+                ? data.ratings.reduce((sum, r) => sum + r, 0) / data.ratings.length
+                : 0,
+            ratingsCount: data.ratings.length,
+            reportsCount: data.reports
+        }))
+            .sort((a, b) => a.week.localeCompare(b.week));
+        // Recipe quality breakdown
+        const recipeQuality = {};
+        kidRecipesQuery.docs.forEach(doc => {
+            const recipe = doc.data();
+            recipeQuality[doc.id] = {
+                name: recipe.originalTitle || 'Unknown Recipe',
+                ratings: [],
+                reports: 0
+            };
+        });
+        ratings.forEach(rating => {
+            if (recipeQuality[rating.kidRecipeId]) {
+                recipeQuality[rating.kidRecipeId].ratings.push(rating.rating);
+            }
+        });
+        reports.forEach(report => {
+            if (recipeQuality[report.kidRecipeId]) {
+                recipeQuality[report.kidRecipeId].reports++;
+            }
+        });
+        const recipeQualityBreakdown = Object.entries(recipeQuality)
+            .map(([id, data]) => ({
+            recipeId: id,
+            recipeName: data.name,
+            averageRating: data.ratings.length > 0
+                ? data.ratings.reduce((sum, r) => sum + r, 0) / data.ratings.length
+                : 0,
+            totalRatings: data.ratings.length,
+            totalReports: data.reports,
+            needsAttention: (data.ratings.length > 0 &&
+                data.ratings.reduce((sum, r) => sum + r, 0) / data.ratings.length < 3.5) || data.reports > 2
+        }))
+            .sort((a, b) => {
+            if (a.needsAttention && !b.needsAttention)
+                return -1;
+            if (!a.needsAttention && b.needsAttention)
+                return 1;
+            return a.averageRating - b.averageRating;
+        });
+        return {
+            success: true,
+            analytics: {
+                totalRecipes,
+                averageRating: Math.round(averageRating * 100) / 100,
+                totalRatings,
+                totalStepReports,
+                improvementRate: Math.round(improvementRate * 100) / 100,
+                qualityTrends,
+                topIssues,
+                recipeQualityBreakdown: recipeQualityBreakdown.slice(0, 20) // Limit results
+            }
+        };
+    }
+    catch (error) {
+        console.error('Error fetching quality analytics:', error);
+        throw new functions.https.HttpsError('internal', 'Failed to fetch quality analytics');
+    }
+});
+exports.triggerQualityAutoRegeneration = functions.pubsub.schedule('0 2 * * *').onRun(async (context) => {
+    var _a;
+    console.log('Starting quality auto-regeneration check...');
+    try {
+        // Find recipes that need regeneration based on quality metrics
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - 7); // Check recipes from last week
+        // Find kid recipes with poor ratings (< 3.5 average) that have enough data
+        const kidRecipesQuery = await admin.firestore()
+            .collection('kidRecipes')
+            .where('createdAt', '>=', admin.firestore.Timestamp.fromDate(cutoffDate))
+            .get();
+        const recipesToCheck = [];
+        for (const recipeDoc of kidRecipesQuery.docs) {
+            const recipe = recipeDoc.data();
+            const recipeId = recipeDoc.id;
+            // Get ratings for this recipe
+            const ratingsQuery = await admin.firestore()
+                .collection('kidRecipeRatings')
+                .where('kidRecipeId', '==', recipeId)
+                .get();
+            if (ratingsQuery.size >= 3) { // Only consider recipes with at least 3 ratings
+                const ratings = ratingsQuery.docs.map(doc => doc.data().rating);
+                const averageRating = ratings.reduce((sum, r) => sum + r, 0) / ratings.length;
+                if (averageRating < 3.5) {
+                    recipesToCheck.push({
+                        id: recipeId,
+                        averageRating,
+                        ratingsCount: ratings.length,
+                        lastRefinedAt: (_a = recipe.lastRefinedAt) === null || _a === void 0 ? void 0 : _a.toDate(),
+                        aiMetadata: recipe.aiMetadata || {}
+                    });
+                }
+            }
+        }
+        console.log(`Found ${recipesToCheck.length} recipes that may need regeneration`);
+        let regeneratedCount = 0;
+        for (const recipe of recipesToCheck) {
+            // Check if recipe was already refined recently
+            if (recipe.lastRefinedAt) {
+                const daysSinceRefinement = (Date.now() - recipe.lastRefinedAt.getTime()) / (1000 * 60 * 60 * 24);
+                if (daysSinceRefinement < 3) {
+                    console.log(`Skipping ${recipe.id} - refined recently`);
+                    continue;
+                }
+            }
+            // Check regeneration count to prevent infinite loops
+            const regenerationCount = recipe.aiMetadata.regenerationCount || 0;
+            if (regenerationCount >= 3) {
+                console.log(`Skipping ${recipe.id} - max regenerations reached`);
+                continue;
+            }
+            try {
+                // Get recent feedback for this recipe
+                const feedbackQuery = await admin.firestore()
+                    .collection('kidRecipeRatings')
+                    .where('kidRecipeId', '==', recipe.id)
+                    .where('rating', '<', 4)
+                    .orderBy('timestamp', 'desc')
+                    .limit(5)
+                    .get();
+                const feedback = feedbackQuery.docs.map(doc => {
+                    const data = doc.data();
+                    return {
+                        rating: data.rating,
+                        feedback: data.feedback || {}
+                    };
+                });
+                // Trigger recipe refinement
+                await triggerRecipeRefinement(recipe.id, recipe, feedback);
+                regeneratedCount++;
+                console.log(`Auto-regenerated recipe ${recipe.id}`);
+                // Don't overwhelm the system - process max 5 recipes per run
+                if (regeneratedCount >= 5) {
+                    break;
+                }
+            }
+            catch (error) {
+                console.error(`Failed to regenerate recipe ${recipe.id}:`, error);
+            }
+        }
+        console.log(`Auto-regeneration completed. Regenerated ${regeneratedCount} recipes.`);
+    }
+    catch (error) {
+        console.error('Error in quality auto-regeneration:', error);
+    }
+});
+// Delete a kid recipe and all associated data
+exports.deleteKidRecipe = functions.https.onCall(async (data, context) => {
+    var _a;
+    try {
+        // Check authentication
+        if (!context.auth || !context.auth.uid) {
+            throw new functions.https.HttpsError('unauthenticated', 'User must be authenticated');
+        }
+        const userId = context.auth.uid;
+        const { kidRecipeId } = data;
+        if (!kidRecipeId) {
+            throw new functions.https.HttpsError('invalid-argument', 'Kid recipe ID is required');
+        }
+        // Get the kid recipe
+        const kidRecipeRef = admin.firestore().collection('kidRecipes').doc(kidRecipeId);
+        const kidRecipeDoc = await kidRecipeRef.get();
+        if (!kidRecipeDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Kid recipe not found');
+        }
+        const kidRecipeData = kidRecipeDoc.data();
+        // Verify the user owns this recipe (through the kid profile)
+        const kidProfileRef = admin.firestore().collection('kidProfiles').doc(kidRecipeData === null || kidRecipeData === void 0 ? void 0 : kidRecipeData.kidId);
+        const kidProfileDoc = await kidProfileRef.get();
+        if (!kidProfileDoc.exists) {
+            throw new functions.https.HttpsError('not-found', 'Kid profile not found');
+        }
+        const kidProfileData = kidProfileDoc.data();
+        // Check if user owns the parent profile associated with this kid
+        const parentProfileRef = admin.firestore().collection('parentProfiles').doc(kidProfileData === null || kidProfileData === void 0 ? void 0 : kidProfileData.parentId);
+        const parentProfileDoc = await parentProfileRef.get();
+        if (!parentProfileDoc.exists || ((_a = parentProfileDoc.data()) === null || _a === void 0 ? void 0 : _a.userId) !== userId) {
+            throw new functions.https.HttpsError('permission-denied', 'You do not have permission to delete this recipe');
+        }
+        // Start a batch operation to delete all related data
+        const batch = admin.firestore().batch();
+        // 1. Delete the main kid recipe
+        batch.delete(kidRecipeRef);
+        // 2. Delete associated ratings
+        const ratingsQuery = await admin.firestore()
+            .collection('kidRecipeRatings')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .get();
+        ratingsQuery.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+        // 3. Delete associated step reports
+        const stepReportsQuery = await admin.firestore()
+            .collection('stepReports')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .get();
+        stepReportsQuery.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+        // 4. Delete shared recipe entries using originalRecipeId and kidId
+        if ((kidRecipeData === null || kidRecipeData === void 0 ? void 0 : kidRecipeData.originalRecipeId) && (kidRecipeData === null || kidRecipeData === void 0 ? void 0 : kidRecipeData.kidId)) {
+            const sharedRecipesQuery = await admin.firestore()
+                .collection('sharedRecipes')
+                .where('parentRecipeId', '==', kidRecipeData.originalRecipeId)
+                .where('kidId', '==', kidRecipeData.kidId)
+                .get();
+            sharedRecipesQuery.docs.forEach(doc => {
+                batch.delete(doc.ref);
+            });
+        }
+        // Also delete any entries that might reference the kidRecipeId directly (fallback)
+        const directSharedRecipesQuery = await admin.firestore()
+            .collection('sharedRecipes')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .get();
+        directSharedRecipesQuery.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+        // 5. Delete cooking sessions
+        const cookingSessionsQuery = await admin.firestore()
+            .collection('cookingSessions')
+            .where('kidRecipeId', '==', kidRecipeId)
+            .get();
+        cookingSessionsQuery.docs.forEach(doc => {
+            batch.delete(doc.ref);
+        });
+        // Execute the batch operation
+        await batch.commit();
+        console.log(`Successfully deleted kid recipe ${kidRecipeId} and all associated data`);
+        return {
+            success: true,
+            message: 'Recipe successfully deleted'
+        };
+    }
+    catch (error) {
+        console.error('Error deleting kid recipe:', error);
+        if (error instanceof functions.https.HttpsError) {
+            throw error;
+        }
+        throw new functions.https.HttpsError('internal', 'Failed to delete recipe: ' + (error instanceof Error ? error.message : 'Unknown error'));
+    }
+});
+// Global recipe cache functions
+async function getRecipeFromCache(url) {
+    try {
+        const normalizedUrl = normalizeUrlForCache(url);
+        const urlHash = hashString(normalizedUrl);
+        const cacheRef = admin.firestore().collection('recipeCache').doc(urlHash);
+        const doc = await cacheRef.get();
+        if (doc.exists) {
+            const data = doc.data();
+            // Return cached recipe if it's less than 30 days old
+            const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+            const createdAt = data.createdAt.toDate();
+            if (createdAt > thirtyDaysAgo) {
+                console.log('Using cached recipe from:', createdAt.toISOString());
+                return {
+                    title: data.title,
+                    description: data.description,
+                    image: data.image,
+                    prepTime: data.prepTime,
+                    cookTime: data.cookTime,
+                    totalTime: data.totalTime,
+                    servings: data.servings,
+                    difficulty: data.difficulty,
+                    ingredients: data.ingredients,
+                    instructions: data.instructions,
+                    sourceUrl: url,
+                    tags: data.tags,
+                };
+            }
+            else {
+                console.log('Cached recipe is stale, will re-scrape');
+            }
+        }
+        return null;
+    }
+    catch (error) {
+        console.error('Error getting recipe from cache:', error);
+        return null; // Fall back to scraping if cache fails
+    }
+}
+async function saveRecipeToCache(url, recipe) {
+    try {
+        const normalizedUrl = normalizeUrlForCache(url);
+        const urlHash = hashString(normalizedUrl);
+        const cacheRef = admin.firestore().collection('recipeCache').doc(urlHash);
+        const cacheEntry = {
+            sourceUrl: url,
+            normalizedUrl,
+            title: recipe.title,
+            description: recipe.description,
+            image: recipe.image,
+            prepTime: recipe.prepTime,
+            cookTime: recipe.cookTime,
+            totalTime: recipe.totalTime,
+            servings: recipe.servings,
+            difficulty: recipe.difficulty,
+            ingredients: recipe.ingredients,
+            instructions: recipe.instructions,
+            tags: recipe.tags,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            provider: 'scrape',
+        };
+        await cacheRef.set(cacheEntry);
+        console.log('Saved recipe to cache:', normalizedUrl);
+    }
+    catch (error) {
+        console.error('Error saving recipe to cache:', error);
+        // Don't throw error - cache failure shouldn't fail the import
+    }
 }
 //# sourceMappingURL=index.js.map

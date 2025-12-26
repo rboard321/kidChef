@@ -27,7 +27,8 @@ export interface ParentProfile {
   parentName: string;
   email: string;
   settings: UserSettings;
-  kidIds: string[]; // References to KidProfile documents
+  kidModePin?: string; // 4-digit PIN to exit kid mode
+  kidIds: string[]; // References to KidProfile documents (legacy)
   createdAt: FirestoreDate;
   updatedAt: FirestoreDate;
 }
@@ -76,14 +77,14 @@ export interface Recipe {
   url?: string;
   image?: string;
   servings: number;
-  prepTime?: number;
-  cookTime?: number;
-  totalTime?: number;
+  prepTime?: number | string;
+  cookTime?: number | string;
+  totalTime?: number | string;
   difficulty?: 'easy' | 'medium' | 'hard';
   cuisine?: string;
   mealType?: 'breakfast' | 'lunch' | 'dinner' | 'snack' | 'dessert';
-  ingredients: Ingredient[];
-  steps: RecipeStep[];
+  ingredients: Array<Ingredient | string>;
+  steps?: RecipeStep[];
   instructions?: string[]; // Legacy field for backward compatibility
   allergens?: string[]; // Common allergens in this recipe
   equipment?: string[]; // Required cooking equipment
@@ -146,7 +147,24 @@ export interface KidRecipe {
   safetyNotes: string[];
   estimatedDuration?: number; // Total time including prep for kids
   skillsRequired?: string[]; // Skills this recipe helps develop
+  conversionCount?: number; // Track how many times converted
+  lastConvertedAt?: FirestoreDate; // When last converted
+  isActive?: boolean; // If false, kid can reconvert
   createdAt: FirestoreDate;
+}
+
+export interface KidRecipeCacheEntry {
+  sourceUrl: string;
+  readingLevel: ReadingLevel;
+  ageRange: string;
+  kidAge: number;
+  simplifiedIngredients: KidIngredient[];
+  simplifiedSteps: KidStep[];
+  safetyNotes: string[];
+  estimatedDuration?: number;
+  skillsRequired?: string[];
+  createdAt: FirestoreDate;
+  updatedAt: FirestoreDate;
 }
 
 export interface KidIngredient {
@@ -208,6 +226,24 @@ export interface FamilyMeal {
   notes?: string;
 }
 
+export interface KidBadge {
+  id: string;
+  name: string;
+  description: string;
+  emoji: string;
+  earnedAt: FirestoreDate;
+  category: 'cooking' | 'safety' | 'creativity' | 'healthy' | 'special';
+}
+
+export interface KidAchievement {
+  id: string;
+  title: string;
+  description: string;
+  type: 'first_recipe' | 'week_streak' | 'healthy_choice' | 'safety_star' | 'creative_chef';
+  unlockedAt: FirestoreDate;
+  celebrationShown: boolean;
+}
+
 // Enhanced Navigation Types
 export type RootStackParamList = {
   Auth: undefined;
@@ -217,23 +253,27 @@ export type RootStackParamList = {
   ParentSettings: { kidData?: { name: string; age: number; readingLevel: 'beginner' | 'intermediate' | 'advanced' } };
   Main: undefined;
   RecipeDetail: { recipeId: string };
-  RecipeView: { recipeId?: string };
+  RecipeView: { recipeId: string; kidId?: string };
   KidRecipeDetail: { kidRecipeId: string };
+  KidRecipeView: { recipeId: string; kidId: string };
   CookingMode: { kidRecipeId: string; kidId?: string };
-  KidSelector: { recipeId: string };
+  KidSelector: undefined;
+  KidManagement: undefined;
   FamilyMeals: undefined;
   CookingHistory: { kidId?: string };
 };
 
+export type AppMode = 'parent' | 'kid';
+
 export type ParentTabParamList = {
   Home: undefined;
   Import: undefined;
+  Kids: undefined;
   Settings: undefined;
 };
 
 export type KidTabParamList = {
   Recipes: undefined;
-  Cooking: undefined;
   Parent: undefined;
 };
 

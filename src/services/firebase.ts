@@ -1,7 +1,7 @@
 import { initializeApp } from 'firebase/app';
-import { initializeAuth, getReactNativePersistence } from 'firebase/auth';
+import { initializeAuth, getReactNativePersistence, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore } from 'firebase/firestore';
-import { getFunctions } from 'firebase/functions';
+import { getFunctions, connectFunctionsEmulator } from 'firebase/functions';
 import { getStorage } from 'firebase/storage';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -25,5 +25,15 @@ export const auth = initializeAuth(app, {
 export const db = getFirestore(app);
 export const functions = getFunctions(app, 'us-central1');
 export const storage = getStorage(app);
+
+// Debug Firebase configuration
+console.log('Firebase app initialized:', app.name);
+console.log('Functions region:', 'us-central1');
+console.log('Auth persistence configured for React Native');
+
+// Set up auth state listener to ensure functions are properly connected
+onAuthStateChanged(auth, (user) => {
+  console.log('Auth state changed:', user ? { uid: user.uid, email: user.email } : 'null');
+});
 
 export default app;

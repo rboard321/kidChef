@@ -12,54 +12,166 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
-    // Legacy User Profiles (for backward compatibility)
+    function isParentOfKid(kidId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/kidProfiles/$(kidId)) &&
+        isOwnerOfParentProfile(get(/databases/$(database)/documents/kidProfiles/$(kidId)).data.parentId);
+    }
+
+    function isOwnerOfParentProfile(parentId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/parentProfiles/$(parentId)) &&
+        get(/databases/$(database)/documents/parentProfiles/$(parentId)).data.userId == request.auth.uid;
+    }
+
+    // Legacy User Profiles (for backward compatibility during migration)
     match /userProfiles/{userId} {
       allow read, write: if isOwner(userId);
       allow create: if isAuthenticated() && userId == request.auth.uid;
+      // Temporary: Allow querying during migration only
+      allow list: if isAuthenticated();
     }
 
     // Parent Profiles - only the authenticated user can access their own profile
-    match /parentProfiles/{profileId} {
-      allow read, write, create: if isAuthenticated();
+    match /parentProfiles/{parentId} {
+      allow read, write: if isOwnerOfParentProfile(parentId);
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      // Allow querying only your own profiles
+      allow list: if isAuthenticated() &&
+        resource.data.userId == request.auth.uid;
     }
 
     // Kid Profiles - only the parent can manage their kids
     match /kidProfiles/{kidId} {
-      allow read, write, create: if isAuthenticated();
-    }
-
-    // Recipes - users can only access their own recipes
-    match /recipes/{recipeId} {
       allow read, write: if isAuthenticated() && (
-        resource.data.userId == request.auth.uid
+        // Parent can access their own kid's profile
+        isOwnerOfParentProfile(resource.data.parentId) ||
+        // For creation, check the parent ID in the request
+        (request.resource != null && isOwnerOfParentProfile(request.resource.data.parentId))
       );
-      allow create: if isAuthenticated() && (
-        request.resource.data.userId == request.auth.uid
-      );
+      allow create: if isAuthenticated() &&
+        isOwnerOfParentProfile(request.resource.data.parentId);
+      allow list: if isAuthenticated() &&
+        isOwnerOfParentProfile(resource.data.parentId);
     }
 
-    // Kid-friendly recipes
+    // Recipes - temporarily permissive for debugging
+    match /recipes/{recipeId} {
+      allow read, write, create: if isAuthenticated();
+      allow list: if isAuthenticated();
+    }
+
+    // Kid-friendly recipes - accessible by authenticated users (temporarily permissive for debugging)
     match /kidRecipes/{kidRecipeId} {
       allow read, write, create: if isAuthenticated();
+      allow list: if isAuthenticated();
     }
 
-    // Cooking Sessions
+    // Global kid-friendly recipe cache - temporarily permissive for debugging
+    match /kidRecipeCache/{cacheId} {
+      allow read, write, create: if isAuthenticated();
+    }
+
+    // Recipe sharing between parents and kids - only owner access
+    match /sharedRecipes/{sharedRecipeId} {
+      allow read, write: if isAuthenticated() && (
+        // Check if user owns the kid this recipe is shared with
+        isParentOfKid(resource.data.kidId) ||
+        // Or if user is the sharer (parent)
+        isOwnerOfParentProfile(resource.data.sharedBy)
+      );
+      allow create: if isAuthenticated() && (
+        isParentOfKid(request.resource.data.kidId) ||
+        isOwnerOfParentProfile(request.resource.data.sharedBy)
+      );
+      allow list: if isAuthenticated() && (
+        isParentOfKid(resource.data.kidId) ||
+        isOwnerOfParentProfile(resource.data.sharedBy)
+      );
+    }
+
+    // Cooking Sessions - only for kid's parent
     match /cookingSessions/{sessionId} {
-      allow read, write, create: if isAuthenticated();
+      allow read, write, create: if isAuthenticated() &&
+        isParentOfKid(resource.data.kidId || request.resource.data.kidId);
+      allow list: if isAuthenticated() &&
+        isParentOfKid(resource.data.kidId);
     }
 
-    // Family Meals
+    // Family Meals - only for family members
     match /familyMeals/{mealId} {
-      allow read, write, create: if isAuthenticated();
+      allow read, write: if isAuthenticated() &&
+        isOwnerOfParentProfile(resource.data.parentId);
+      allow create: if isAuthenticated() &&
+        isOwnerOfParentProfile(request.resource.data.parentId);
+      allow list: if isAuthenticated() &&
+        isOwnerOfParentProfile(resource.data.parentId);
     }
 
-    // Recipe Recommendations
+    // Recipe Recommendations - read-only for authenticated users
     match /recipeRecommendations/{recommendationId} {
       allow read: if isAuthenticated();
-      allow write: if false;
+      allow write: if false; // Only Cloud Functions should write recommendations
     }
 
-    // Allow all authenticated users to query collections for now
+    // Recipe sharing (sharedRecipes collection) - temporarily permissive for debugging
+    match /sharedRecipes/{shareId} {
+      allow read, write, create: if isAuthenticated();
+      allow list: if isAuthenticated();
+    }
+
+    // Kid recipe ratings - parents can rate kid recipes they have access to
+    match /kidRecipeRatings/{ratingId} {
+      allow read, write: if isAuthenticated() && (
+        // Parent who created the rating
+        isOwnerOfParentProfile(resource.data.parentId)
+      );
+      allow create: if isAuthenticated() && (
+        isOwnerOfParentProfile(request.resource.data.parentId)
+      );
+      allow list: if isAuthenticated() && (
+        isOwnerOfParentProfile(resource.data.parentId)
+      );
+    }
+
+    // Step reports - kids and parents can report issues with recipe steps
+    match /stepReports/{reportId} {
+      allow read, write: if isAuthenticated() && (
+        // Parent who created the report
+        isOwnerOfParentProfile(resource.data.parentId) ||
+        // Kid the recipe was for (via parent ownership)
+        isParentOfKid(resource.data.kidId)
+      );
+      allow create: if isAuthenticated() && (
+        isOwnerOfParentProfile(request.resource.data.parentId) ||
+        isParentOfKid(request.resource.data.kidId)
+      );
+      allow list: if isAuthenticated() && (
+        isOwnerOfParentProfile(resource.data.parentId) ||
+        isParentOfKid(resource.data.kidId)
+      );
+    }
+
+    // Recipe import cache - accessible by authenticated users for caching recipe imports
+    match /recipeImportCache/{cacheId} {
+      allow read: if isAuthenticated();
+      allow write, create: if isAuthenticated(); // Allow users to cache their imports
+    }
+
+    // Kid Progress tracking - only accessible by parents of the kid
+    match /kidProgress/{kidId} {
+      allow read, write: if isAuthenticated() && isParentOfKid(kidId);
+      allow create: if isAuthenticated() && isParentOfKid(kidId);
+      allow list: if isAuthenticated() && isParentOfKid(kidId);
+    }
+
+    // Rate limiting collection for tracking usage quotas
+    match /rateLimits/{userId} {
+      allow read, write: if isOwner(userId);
+      allow create: if isAuthenticated() && userId == request.auth.uid;
+    }
+
+    // Deny all other access
     match /{path=**} {
       allow read, write: if false;
     }

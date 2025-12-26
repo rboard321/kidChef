@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../../contexts/AuthContext';
+import { PinChangeModal } from '../../components/PinChangeModal';
 
 export default function SettingsScreen() {
   const [safetyNotes, setSafetyNotes] = useState(true);
@@ -17,8 +18,9 @@ export default function SettingsScreen() {
   const [autoSimplify, setAutoSimplify] = useState(false);
   const [notifications, setNotifications] = useState(true);
   const [darkMode, setDarkMode] = useState(false);
+  const [showPinChangeModal, setShowPinChangeModal] = useState(false);
 
-  const { user, userProfile, signOut } = useAuth();
+  const { user, parentProfile, changePIN, signOut } = useAuth();
 
   const handleSignOut = () => {
     Alert.alert(
@@ -42,6 +44,26 @@ export default function SettingsScreen() {
         },
       ]
     );
+  };
+
+  const handleChangePIN = () => {
+    if (!parentProfile?.kidModePin) {
+      Alert.alert(
+        'No PIN Set',
+        'You need to create a kid profile first to set up a PIN.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+    setShowPinChangeModal(true);
+  };
+
+  const handlePinChanged = async (newPin: string) => {
+    try {
+      await changePIN(newPin);
+    } catch (error: any) {
+      throw new Error(error.message || 'Failed to change PIN');
+    }
   };
 
   const SettingItem = ({
@@ -88,6 +110,12 @@ export default function SettingsScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
+      <PinChangeModal
+        visible={showPinChangeModal}
+        onClose={() => setShowPinChangeModal(false)}
+        onPinChanged={handlePinChanged}
+        currentPin={parentProfile?.kidModePin}
+      />
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <Text style={styles.title}>Settings</Text>
@@ -120,6 +148,23 @@ export default function SettingsScreen() {
             onValueChange={setAutoSimplify}
             icon="✨"
           />
+
+          <TouchableOpacity style={styles.settingItem} onPress={handleChangePIN}>
+            <View style={styles.settingIcon}>
+              <Text style={styles.iconText}>🔐</Text>
+            </View>
+            <View style={styles.settingContent}>
+              <Text style={styles.settingTitle}>Kid Mode PIN</Text>
+              <Text style={styles.settingDescription}>
+                {parentProfile?.kidModePin
+                  ? 'Tap to change your PIN for exiting kid mode'
+                  : 'Set up when creating your first kid profile'}
+              </Text>
+            </View>
+            {parentProfile?.kidModePin && (
+              <Text style={styles.settingAction}>Change</Text>
+            )}
+          </TouchableOpacity>
         </View>
 
         <View style={styles.section}>
@@ -192,7 +237,7 @@ export default function SettingsScreen() {
             Signed in as: {user?.email || 'Unknown'}
           </Text>
           <Text style={styles.accountInfo}>
-            Family: {userProfile?.familyName || 'Unknown'}
+            Family: {parentProfile?.familyName || 'Unknown'}
           </Text>
 
           <ActionButton
@@ -322,5 +367,10 @@ const styles = StyleSheet.create({
     color: '#6b7280',
     marginBottom: 8,
     paddingHorizontal: 20,
+  },
+  settingAction: {
+    fontSize: 14,
+    color: '#2563eb',
+    fontWeight: '600',
   },
 });
