@@ -67,6 +67,50 @@ export interface UserSettings {
   theme: 'light' | 'dark' | 'auto';
 }
 
+// Recipe Category and Rating Types
+export type RecipeCategory =
+  | 'quick-meals'      // 30 minutes or less
+  | 'no-cook'          // No cooking required
+  | 'baking'           // Baking and desserts
+  | 'healthy'          // Nutritious options
+  | 'kid-favorites'    // Popular with kids
+  | 'cultural'         // International cuisine
+  | 'holiday'          // Special occasions
+  | 'beginner-friendly' // Great for new cooks
+  | 'advanced'         // For experienced kid chefs
+  | 'one-pot';         // Minimal cleanup
+
+export interface RecipeRating {
+  id: string;
+  recipeId: string;
+  kidId: string;
+  parentId: string;
+  rating: 1 | 2 | 3 | 4 | 5; // 1 = 😕, 2 = 😐, 3 = 🙂, 4 = 😋, 5 = 🤤
+  emoji: '😕' | '😐' | '🙂' | '😋' | '🤤';
+  comment?: string;
+  createdAt: FirestoreDate;
+}
+
+export interface RecipeFavorite {
+  id: string;
+  recipeId: string;
+  kidId?: string;
+  parentId: string;
+  parentUserId: string;
+  isFavorited: boolean;
+  createdAt: FirestoreDate;
+  updatedAt: FirestoreDate;
+}
+
+export interface RecipeRecommendation {
+  id: string;
+  kidId: string;
+  recipeId: string;
+  reason: 'skill_level' | 'age_appropriate' | 'dietary_match' | 'progression' | 'popular';
+  confidence: number; // 0-1 confidence score
+  createdAt: FirestoreDate;
+}
+
 // Enhanced Recipe Types
 export interface Recipe {
   id: string;
@@ -89,6 +133,11 @@ export interface Recipe {
   allergens?: string[]; // Common allergens in this recipe
   equipment?: string[]; // Required cooking equipment
   tags?: string[]; // Custom tags for organization
+  categories?: RecipeCategory[]; // Recipe categories for better organization
+  averageRating?: number; // Average rating from 1-5
+  ratingCount?: number; // Number of ratings received
+  isRecommended?: boolean; // Marked as recommended by system
+  skillsRequired?: string[]; // Skills this recipe teaches/requires
   nutritionInfo?: NutritionInfo;
   kidVersionId?: string; // Reference to simplified version
   isFavorite?: boolean;

@@ -20,6 +20,7 @@ import ImportRecipeScreen from '../screens/parent/ImportRecipeScreen';
 import KidManagementScreen from '../screens/parent/KidManagementScreen';
 import RecipeDetailScreen from '../screens/parent/RecipeDetailScreen';
 import RecipeManagementScreen from '../screens/parent/RecipeManagementScreen';
+import FavoritesScreen from '../screens/parent/FavoritesScreen';
 
 // Kid screens
 import KidHomeScreen from '../screens/kid/KidHomeScreen';
@@ -232,6 +233,14 @@ export default function AppNavigator() {
               options={{
                 headerShown: true,
                 title: 'Recipe Management'
+              }}
+            />
+            <RootStack.Screen
+              name="Favorites"
+              component={FavoritesScreen}
+              options={{
+                headerShown: true,
+                title: 'Favorites'
               }}
             />
           </>

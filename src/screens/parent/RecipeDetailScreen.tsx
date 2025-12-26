@@ -14,6 +14,7 @@ import { useRoute, useNavigation } from '@react-navigation/native';
 import { recipeService } from '../../services/recipes';
 import { recipeSharingService } from '../../services/recipeSharing';
 import { kidRecipeManagerService } from '../../services/kidRecipeManager';
+import { recipeFavoritesService } from '../../services/recipeFavorites';
 import { useAuth } from '../../contexts/AuthContext';
 import { SkeletonRecipeDetail } from '../../components/SkeletonLoader';
 import { checkRecipeSafety, generateSafetyWarningText } from '../../utils/recipeSafety';
@@ -23,7 +24,7 @@ export default function RecipeDetailScreen() {
   const route = useRoute();
   const navigation = useNavigation();
   const { recipeId } = route.params as { recipeId: string };
-  const { kidProfiles, user } = useAuth();
+  const { kidProfiles, user, parentProfile } = useAuth();
 
   const [recipe, setRecipe] = useState<Recipe | null>(null);
   const [loading, setLoading] = useState(true);
@@ -32,6 +33,8 @@ export default function RecipeDetailScreen() {
   const [servings, setServings] = useState(4);
   const [scaleMultiplier, setScaleMultiplier] = useState(1);
   const [sharedKids, setSharedKids] = useState<string[]>([]);
+  const [isFavorite, setIsFavorite] = useState(false);
+  const [favoriteLoading, setFavoriteLoading] = useState(false);
 
   useEffect(() => {
     loadRecipe();
@@ -46,6 +49,7 @@ export default function RecipeDetailScreen() {
         setServings(recipeData.servings || 4);
         setScaleMultiplier(1);
         await loadSharedKids();
+        await loadFavoriteStatus();
       } else {
         Alert.alert('Error', 'Recipe not found');
       }
@@ -54,6 +58,17 @@ export default function RecipeDetailScreen() {
       Alert.alert('Error', 'Failed to load recipe');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadFavoriteStatus = async () => {
+    if (!parentProfile) return;
+
+    try {
+      const favoriteStatus = await recipeFavoritesService.isFavorite(recipeId, parentProfile.id);
+      setIsFavorite(favoriteStatus);
+    } catch (error) {
+      console.error('Error loading favorite status:', error);
     }
   };
 
@@ -336,6 +351,27 @@ export default function RecipeDetailScreen() {
     }
   };
 
+  const handleToggleFavorite = async () => {
+    console.log('handleToggleFavorite called', { recipeId, parentProfile: !!parentProfile });
+    if (!parentProfile) {
+      console.log('No parent profile available');
+      return;
+    }
+
+    try {
+      setFavoriteLoading(true);
+      console.log('Calling toggleFavorite service...');
+      const newFavoriteStatus = await recipeFavoritesService.toggleFavorite(recipeId, parentProfile.id);
+      console.log('Toggle favorite result:', newFavoriteStatus);
+      setIsFavorite(newFavoriteStatus);
+    } catch (error) {
+      console.error('Error toggling favorite:', error);
+      Alert.alert('Error', 'Failed to update favorite status. Please try again.');
+    } finally {
+      setFavoriteLoading(false);
+    }
+  };
+
   const handleShare = () => {
     console.log('Sharing recipe...');
   };
@@ -396,6 +432,30 @@ export default function RecipeDetailScreen() {
     <SafeAreaView style={styles.container}>
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
+          <View style={styles.headerTop}>
+            <TouchableOpacity
+              style={styles.favoriteButton}
+              onPress={() => {
+                console.log('Favorite button touched!');
+                handleToggleFavorite();
+              }}
+              disabled={favoriteLoading}
+              activeOpacity={0.7}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              {favoriteLoading ? (
+                <ActivityIndicator size="small" color="#ef4444" />
+              ) : (
+                <Text style={[
+                  styles.favoriteIcon,
+                  isFavorite && styles.favoriteIconActive
+                ]}>
+                  {isFavorite ? '❤️' : '🤍'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
           {recipe.image && recipe.image.startsWith('http') ? (
             <Image
               source={{ uri: recipe.image }}
@@ -574,6 +634,33 @@ const styles = StyleSheet.create({
     padding: 20,
     alignItems: 'center',
     marginBottom: 20,
+    position: 'relative',
+  },
+  headerTop: {
+    position: 'absolute',
+    top: 20,
+    right: 20,
+    zIndex: 1,
+  },
+  favoriteButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255, 255, 255, 0.9)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+    zIndex: 2,
+  },
+  favoriteIcon: {
+    fontSize: 24,
+  },
+  favoriteIconActive: {
+    transform: [{ scale: 1.1 }],
   },
   emoji: {
     fontSize: 60,
@@ -591,6 +678,8 @@ const styles = StyleSheet.create({
     color: '#1f2937',
     textAlign: 'center',
     marginBottom: 10,
+    paddingTop: 10,
+    paddingHorizontal: 50,
   },
   description: {
     fontSize: 16,

@@ -251,7 +251,7 @@ ${cleanedText}`;
     return validated;
 }
 async function extractRecipeFromUrl(url) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l;
     try {
         const cached = await getRecipeCache(url);
         if (cached) {
@@ -375,6 +375,9 @@ async function extractRecipeFromUrl(url) {
             }
             if (((_k = error.response) === null || _k === void 0 ? void 0 : _k.status) === 404) {
                 throw new Error('Recipe page not found');
+            }
+            if (((_l = error.response) === null || _l === void 0 ? void 0 : _l.status) === 403) {
+                throw new Error('This website blocks automated recipe imports. Please try copying the recipe manually or use a different website.');
             }
             if (error.code === 'ECONNABORTED') {
                 throw new Error('Request timed out');

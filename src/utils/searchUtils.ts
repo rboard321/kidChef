@@ -190,27 +190,55 @@ export interface SearchFilters {
 export const filterRecipes = (recipes: Recipe[], filters: SearchFilters): Recipe[] => {
   return recipes.filter(recipe => {
     // Cuisine filter
-    if (filters.cuisine && recipe.cuisine !== filters.cuisine) {
+    if (filters.cuisine &&
+        normalizeSearchTerm(recipe.cuisine || '') !== normalizeSearchTerm(filters.cuisine)) {
       return false;
     }
 
-    // Meal type filter
-    if (filters.mealType && recipe.mealType !== filters.mealType) {
-      return false;
+    // Meal type filter - check both mealType field and tags array
+    if (filters.mealType) {
+      const filterMealType = normalizeSearchTerm(filters.mealType);
+      const recipeMealType = normalizeSearchTerm(recipe.mealType || '');
+
+      // Check mealType field first
+      let mealTypeMatches = recipeMealType === filterMealType;
+
+      // If no match, check tags array as fallback
+      if (!mealTypeMatches && recipe.tags && Array.isArray(recipe.tags)) {
+        mealTypeMatches = recipe.tags.some(tag =>
+          normalizeSearchTerm(tag) === filterMealType
+        );
+      }
+
+      if (!mealTypeMatches) {
+        return false;
+      }
     }
 
     // Difficulty filter
-    if (filters.difficulty && recipe.difficulty !== filters.difficulty) {
+    if (filters.difficulty &&
+        normalizeSearchTerm(recipe.difficulty || '') !== normalizeSearchTerm(filters.difficulty)) {
       return false;
     }
 
-    // Cook time filter
-    if (filters.maxCookTime && recipe.cookTime) {
-      const cookTime = typeof recipe.cookTime === 'number'
-        ? recipe.cookTime
-        : parseInt(recipe.cookTime.toString().replace(/\D/g, ''), 10);
-      if (cookTime > filters.maxCookTime) {
-        return false;
+    // Cook time filter - check cookTime first, then totalTime as fallback
+    if (filters.maxCookTime) {
+      const timeStr = (recipe.cookTime || recipe.totalTime || '').toString();
+      if (timeStr) {
+        let cookTime: number;
+
+        // Parse time strings that might include units (e.g., "30 minutes", "1 hour")
+        if (timeStr.toLowerCase().includes('hour')) {
+          const hours = parseFloat(timeStr.replace(/[^\d.]/g, ''));
+          cookTime = hours * 60; // Convert to minutes
+        } else {
+          // Extract numbers from string, assume minutes if no unit specified
+          cookTime = parseFloat(timeStr.replace(/[^\d.]/g, '')) || 0;
+        }
+
+        if (cookTime > filters.maxCookTime) {
+          return false;
+        }
       }
     }
 

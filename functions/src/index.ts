@@ -451,6 +451,9 @@ async function extractRecipeFromUrl(url: string): Promise<ScrapedRecipe> {
       if (error.response?.status === 404) {
         throw new Error('Recipe page not found');
       }
+      if (error.response?.status === 403) {
+        throw new Error('This website blocks automated recipe imports. Please try copying the recipe manually or use a different website.');
+      }
       if (error.code === 'ECONNABORTED') {
         throw new Error('Request timed out');
       }

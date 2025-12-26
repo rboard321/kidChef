@@ -18,7 +18,8 @@ import { SkeletonRecipeList } from '../../components/SkeletonLoader';
 import { Toast } from '../../components/Toast';
 import { importProgressService } from '../../services/importProgressService';
 import { SearchBar } from '../../components/SearchBar';
-import { searchRecipes } from '../../utils/searchUtils';
+import { searchRecipes, filterRecipes, SearchFilters } from '../../utils/searchUtils';
+import FilterChips, { FilterOption } from '../../components/FilterChips';
 import type { Recipe } from '../../types';
 
 export default function ParentHomeScreen() {
@@ -27,6 +28,7 @@ export default function ParentHomeScreen() {
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [filteredRecipes, setFilteredRecipes] = useState<Recipe[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeFilters, setActiveFilters] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [toast, setToast] = useState<{ visible: boolean; message: string; type?: 'success' | 'info'; actionText?: string; onAction?: () => void }>({
@@ -84,18 +86,52 @@ export default function ParentHomeScreen() {
     return unsubscribe;
   }, [navigation]);
 
-  // Handle search filtering
+  // Handle search and filter combination
   useEffect(() => {
-    if (searchQuery.trim() === '') {
-      setFilteredRecipes(recipes);
-    } else {
-      const filtered = searchRecipes(recipes, searchQuery);
-      setFilteredRecipes(filtered);
+    let filtered = recipes;
+
+    // Apply search first
+    if (searchQuery.trim() !== '') {
+      filtered = searchRecipes(filtered, searchQuery);
     }
-  }, [searchQuery, recipes]);
+
+    // Apply active filters
+    if (activeFilters.length > 0) {
+      const searchFilters: SearchFilters = {};
+
+      activeFilters.forEach(filterId => {
+        const filterOption = filterOptions.find(opt => opt.id === filterId);
+        if (filterOption && filterOption.value) {
+          Object.assign(searchFilters, filterOption.value);
+        }
+      });
+
+      filtered = filterRecipes(filtered, searchFilters);
+    }
+
+    setFilteredRecipes(filtered);
+  }, [searchQuery, recipes, activeFilters]);
 
   const handleSearch = (query: string) => {
     setSearchQuery(query);
+  };
+
+  // Define filter options for parent mode
+  const filterOptions: FilterOption[] = [
+    { id: 'quick', label: 'Quick (< 30min)', emoji: '⏰', value: { maxCookTime: 30 } },
+    { id: 'under_hour', label: 'Under 1 Hour', emoji: '⏱️', value: { maxCookTime: 60 } },
+    { id: 'breakfast', label: 'Breakfast', emoji: '🌅', value: { mealType: 'breakfast' } },
+    { id: 'dessert', label: 'Desserts', emoji: '🍰', value: { mealType: 'dessert' } },
+    { id: 'snack', label: 'Snacks', emoji: '🥨', value: { mealType: 'snack' } },
+    { id: 'easy', label: 'Easy', emoji: '👍', value: { difficulty: 'easy' } },
+  ];
+
+  const handleFilterPress = (filterId: string) => {
+    setActiveFilters(prev =>
+      prev.includes(filterId)
+        ? prev.filter(id => id !== filterId)
+        : [...prev, filterId]
+    );
   };
 
 
@@ -203,43 +239,57 @@ export default function ParentHomeScreen() {
         onAction={toast.onAction}
       />
       <View style={styles.header}>
-        <View style={styles.headerContent}>
-          <View style={styles.titleContainer}>
-            <Text style={styles.title}>My Recipes</Text>
-            <Text style={styles.subtitle}>
-              {searchQuery ? `${filteredRecipes.length} of ${recipes.length} recipes` : 'Your family recipe collection'}
-            </Text>
-            {!loading && !refreshing && !searchQuery && (
-              <Text style={styles.pullToRefreshHint}>Pull down to refresh</Text>
-            )}
-          </View>
-          <View style={styles.headerButtons}>
-            {kidProfiles.length > 0 && (
-              <TouchableOpacity
-                style={styles.manageRecipesButton}
-                onPress={() => navigation.navigate('RecipeManagement' as never)}
-              >
-                <Text style={styles.manageRecipesButtonText}>🗑️ Manage</Text>
-              </TouchableOpacity>
-            )}
-            {kidProfiles.length > 0 && (
-              <TouchableOpacity
-                style={styles.kidModeButton}
-                onPress={() => setDeviceMode('kid')}
-              >
-                <Text style={styles.kidModeButtonText}>👶 Kid Mode</Text>
-              </TouchableOpacity>
-            )}
-          </View>
+        <View style={styles.titleSection}>
+          <Text style={styles.title}>My Recipes</Text>
+          <Text style={styles.subtitle}>
+            {searchQuery || activeFilters.length > 0
+              ? `${filteredRecipes.length} of ${recipes.length} recipes`
+              : 'Your family recipe collection'}
+          </Text>
+          {!loading && !refreshing && !searchQuery && (
+            <Text style={styles.pullToRefreshHint}>Pull down to refresh</Text>
+          )}
+        </View>
+        <View style={styles.headerButtons}>
+          <TouchableOpacity
+            style={styles.favoritesButton}
+            onPress={() => navigation.navigate('Favorites' as never)}
+          >
+            <Text style={styles.favoritesButtonText}>❤️ Favorites</Text>
+          </TouchableOpacity>
+          {kidProfiles.length > 0 && (
+            <TouchableOpacity
+              style={styles.manageRecipesButton}
+              onPress={() => navigation.navigate('RecipeManagement' as never)}
+            >
+              <Text style={styles.manageRecipesButtonText}>🗑️ Manage</Text>
+            </TouchableOpacity>
+          )}
+          {kidProfiles.length > 0 && (
+            <TouchableOpacity
+              style={styles.kidModeButton}
+              onPress={() => setDeviceMode('kid')}
+            >
+              <Text style={styles.kidModeButtonText}>👶 Kid Mode</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
 
       {!loading && recipes.length > 0 && (
-        <View style={styles.searchContainer}>
-          <SearchBar
-            placeholder="Search recipes, cuisine, ingredients..."
-            value={searchQuery}
-            onChangeText={handleSearch}
+        <View>
+          <View style={styles.searchContainer}>
+            <SearchBar
+              placeholder="Search recipes, cuisine, ingredients..."
+              value={searchQuery}
+              onChangeText={handleSearch}
+            />
+          </View>
+          <FilterChips
+            filters={filterOptions}
+            activeFilters={activeFilters}
+            onFilterPress={handleFilterPress}
+            kidMode={false}
           />
         </View>
       )}
@@ -294,13 +344,9 @@ const styles = StyleSheet.create({
     padding: 20,
     paddingTop: 10,
   },
-  headerContent: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+  titleSection: {
     alignItems: 'center',
-  },
-  titleContainer: {
-    flex: 1,
+    marginBottom: 15,
   },
   title: {
     fontSize: 28,
@@ -320,7 +366,28 @@ const styles = StyleSheet.create({
   },
   headerButtons: {
     flexDirection: 'row',
+    justifyContent: 'center',
+    flexWrap: 'wrap',
     gap: 10,
+  },
+  favoritesButton: {
+    backgroundColor: '#ef4444',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
+  },
+  favoritesButtonText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: '600',
   },
   searchContainer: {
     paddingHorizontal: 20,

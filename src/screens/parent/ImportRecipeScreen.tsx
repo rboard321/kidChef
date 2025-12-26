@@ -91,6 +91,9 @@ export default function ImportRecipeScreen() {
         type: 'success'
       });
 
+      // Stop loading immediately after successful import
+      setLoading(false);
+
       // Navigate to home after showing success message
       setTimeout(() => {
         navigation.navigate('Home' as never);

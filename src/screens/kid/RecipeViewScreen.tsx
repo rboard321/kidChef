@@ -17,6 +17,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import { recipeService } from '../../services/recipes';
 import { kidRecipeManagerService } from '../../services/kidRecipeManager';
 import { kidProgressService } from '../../services/kidProgressService';
+import { recipeFavoritesService } from '../../services/recipeFavorites';
 import { BadgeNotification } from '../../components/BadgeNotification';
 import PinInput from '../../components/PinInput';
 import type { KidRecipe, Recipe, KidBadge } from '../../types';
@@ -40,6 +41,8 @@ export default function RecipeViewScreen() {
   const [completingRecipe, setCompletingRecipe] = useState(false);
   const [showParentVerification, setShowParentVerification] = useState(false);
   const [pendingCompletion, setPendingCompletion] = useState(false);
+  const [isFavorite, setIsFavorite] = useState(false);
+  const [favoriteLoading, setFavoriteLoading] = useState(false);
 
   const effectiveKidId = kidId || currentKid?.id;
 
@@ -118,6 +121,7 @@ export default function RecipeViewScreen() {
           if (isMounted) {
             setKidRecipe(kidVersion);
             setCurrentStep(0);
+            await loadFavoriteStatus(recipeId, effectiveKidId);
           }
         }
       } catch (error) {
@@ -134,6 +138,32 @@ export default function RecipeViewScreen() {
       isMounted = false;
     };
   }, [recipeId, effectiveKidId, currentKid]);
+
+  const loadFavoriteStatus = async (recipeId: string, kidId: string) => {
+    if (!parentProfile) return;
+
+    try {
+      const favoriteStatus = await recipeFavoritesService.isFavorite(recipeId, parentProfile.id, kidId);
+      setIsFavorite(favoriteStatus);
+    } catch (error) {
+      console.error('Error loading favorite status:', error);
+    }
+  };
+
+  const handleToggleFavorite = async () => {
+    if (!parentProfile || !effectiveKidId) return;
+
+    try {
+      setFavoriteLoading(true);
+      const newFavoriteStatus = await recipeFavoritesService.toggleFavorite(recipeId, parentProfile.id, effectiveKidId);
+      setIsFavorite(newFavoriteStatus);
+    } catch (error) {
+      console.error('Error toggling favorite:', error);
+      Alert.alert('Oops!', 'We couldn\'t save your favorite right now. Please try again!');
+    } finally {
+      setFavoriteLoading(false);
+    }
+  };
 
   const nextStep = () => {
     if (kidRecipe && currentStep < kidRecipe.simplifiedSteps.length - 1) {
@@ -325,6 +355,22 @@ export default function RecipeViewScreen() {
     <SafeAreaView style={styles.container}>
       <ScrollView style={styles.content}>
         <View style={styles.header}>
+          <View style={styles.headerTop}>
+            <TouchableOpacity
+              style={styles.kidFavoriteButton}
+              onPress={handleToggleFavorite}
+              disabled={favoriteLoading}
+            >
+              {favoriteLoading ? (
+                <ActivityIndicator size="small" color="#ef4444" />
+              ) : (
+                <Text style={styles.kidFavoriteIcon}>
+                  {isFavorite ? '💖' : '🤍'}
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+
           {parentRecipe.image && parentRecipe.image.startsWith('http') ? (
             <Image
               source={{ uri: parentRecipe.image }}
@@ -506,6 +552,31 @@ const styles = StyleSheet.create({
     padding: 20,
     backgroundColor: 'white',
     marginBottom: 20,
+    position: 'relative',
+  },
+  headerTop: {
+    position: 'absolute',
+    top: 20,
+    right: 20,
+    zIndex: 1,
+  },
+  kidFavoriteButton: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 3,
+    borderColor: '#bae6fd',
+    shadowColor: '#2563eb',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  kidFavoriteIcon: {
+    fontSize: 28,
   },
   emoji: {
     fontSize: 60,

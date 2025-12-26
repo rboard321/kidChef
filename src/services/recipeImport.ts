@@ -1,6 +1,7 @@
 import { httpsCallable } from 'firebase/functions';
 import { functions, auth } from './firebase';
 import type { Recipe } from '../types';
+import { validateString, sanitizeHtml, ValidationError } from '../utils/validation';
 
 export interface RecipeImportService {
   importFromUrl: (url: string, options?: ImportOptions) => Promise<ImportResult>;
@@ -55,8 +56,36 @@ interface ScrapedRecipe {
 export const recipeImportService: RecipeImportService = {
   validateUrl(url: string): boolean {
     try {
-      const urlObj = new URL(url);
-      return urlObj.protocol === 'http:' || urlObj.protocol === 'https:';
+      // Basic validation first
+      const validatedUrl = validateString(url, 'URL', {
+        required: true,
+        maxLength: 2048, // Standard max URL length
+        allowEmpty: false
+      });
+
+      const urlObj = new URL(validatedUrl);
+
+      // Only allow HTTP/HTTPS protocols
+      if (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:') {
+        return false;
+      }
+
+      // Basic domain validation
+      if (!urlObj.hostname || urlObj.hostname.length === 0) {
+        return false;
+      }
+
+      // Prevent localhost and private IP addresses for security
+      const hostname = urlObj.hostname.toLowerCase();
+      if (hostname === 'localhost' ||
+          hostname.startsWith('127.') ||
+          hostname.startsWith('10.') ||
+          hostname.startsWith('192.168.') ||
+          hostname.startsWith('172.')) {
+        return false;
+      }
+
+      return true;
     } catch {
       return false;
     }
@@ -86,8 +115,10 @@ export const recipeImportService: RecipeImportService = {
       try {
         onProgress?.(ImportStatus.FETCHING);
 
-        console.log('Calling importRecipeSecure with URL:', url);
-        console.log('Current auth user:', auth.currentUser ? { uid: auth.currentUser.uid, email: auth.currentUser.email } : 'null');
+        if (__DEV__) {
+          console.log('Calling importRecipeSecure with URL:', url);
+          console.log('Current auth user:', auth.currentUser ? { uid: auth.currentUser.uid } : 'null');
+        }
 
         // Check if user is authenticated
         if (!auth.currentUser) {
@@ -96,23 +127,28 @@ export const recipeImportService: RecipeImportService = {
 
         // Get fresh auth token to ensure we're authenticated
         const token = await auth.currentUser.getIdToken(true); // Force refresh
-        console.log('Got auth token:', token ? 'present' : 'null');
-        console.log('Token preview:', token ? token.substring(0, 50) + '...' : 'null');
+        if (__DEV__) {
+          console.log('Got auth token:', token ? 'present' : 'null');
+        }
 
         // Use HTTP endpoint that properly handles React Native auth
         const functionUrl = 'https://us-central1-kidchef.cloudfunctions.net/importRecipeHttp';
 
-        console.log('Calling importRecipeHttp via HTTP with proper auth...');
+        if (__DEV__) {
+          console.log('Calling importRecipeHttp via HTTP with proper auth...');
+        }
 
         const headers = {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`,
         };
 
-        console.log('Request headers:', {
-          'Content-Type': headers['Content-Type'],
-          'Authorization': headers.Authorization ? headers.Authorization.substring(0, 20) + '...' : 'null'
-        });
+        if (__DEV__) {
+          console.log('Request headers:', {
+            'Content-Type': headers['Content-Type'],
+            'Authorization': headers.Authorization ? headers.Authorization.substring(0, 20) + '...' : 'null'
+          });
+        }
 
         const response = await fetch(functionUrl, {
           method: 'POST',
@@ -120,11 +156,15 @@ export const recipeImportService: RecipeImportService = {
           body: JSON.stringify({ url })
         });
 
-        console.log('HTTP response status:', response.status);
+        if (__DEV__) {
+          console.log('HTTP response status:', response.status);
+        }
 
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
-          console.log('HTTP error response:', errorData);
+          if (__DEV__) {
+            console.log('HTTP error response:', errorData);
+          }
           const message = errorData.message || errorData.error || `HTTP ${response.status}`;
           const httpError = new Error(message) as Error & { code?: string };
           if (errorData.code) {
@@ -134,7 +174,9 @@ export const recipeImportService: RecipeImportService = {
         }
 
         const result = await response.json();
-        console.log('HTTP result:', result);
+        if (__DEV__) {
+          console.log('HTTP result:', result);
+        }
 
         if (result.success) {
           onProgress?.(ImportStatus.COMPLETE);
@@ -295,6 +337,9 @@ export const recipeImportService: RecipeImportService = {
   },
 
   convertScrapedRecipe(scraped: ScrapedRecipe): Omit<Recipe, 'id' | 'userId' | 'createdAt' | 'updatedAt'> {
+    const tags = scraped.tags || this.extractTagsFromTitle(scraped.title);
+    const mealType = this.inferMealType(scraped.title, tags);
+
     return {
       title: scraped.title,
       description: scraped.description || '',
@@ -307,7 +352,8 @@ export const recipeImportService: RecipeImportService = {
       ingredients: scraped.ingredients,
       instructions: scraped.instructions,
       sourceUrl: scraped.sourceUrl,
-      tags: scraped.tags || this.extractTagsFromTitle(scraped.title),
+      tags: tags,
+      mealType: mealType,
       kidVersionId: null,
     };
   },
@@ -374,5 +420,46 @@ export const recipeImportService: RecipeImportService = {
     }
 
     return [...new Set(tags)]; // Remove duplicates
+  },
+
+  inferMealType(title: string, tags: string[]): string {
+    const lowerTitle = title.toLowerCase();
+    const allTags = tags.map(tag => tag.toLowerCase());
+
+    // Check for dessert keywords
+    if (allTags.includes('dessert') || allTags.includes('baking') ||
+        lowerTitle.includes('cookie') || lowerTitle.includes('cake') ||
+        lowerTitle.includes('cupcake') || lowerTitle.includes('pie') ||
+        lowerTitle.includes('ice cream') || lowerTitle.includes('chocolate') ||
+        lowerTitle.includes('candy') || lowerTitle.includes('brownie')) {
+      return 'Dessert';
+    }
+
+    // Check for breakfast keywords
+    if (allTags.includes('breakfast') ||
+        lowerTitle.includes('pancake') || lowerTitle.includes('waffle') ||
+        lowerTitle.includes('cereal') || lowerTitle.includes('toast') ||
+        lowerTitle.includes('muffin') || lowerTitle.includes('oatmeal')) {
+      return 'Breakfast';
+    }
+
+    // Check for lunch keywords
+    if (allTags.includes('lunch') ||
+        lowerTitle.includes('sandwich') || lowerTitle.includes('wrap') ||
+        lowerTitle.includes('salad')) {
+      return 'Lunch';
+    }
+
+    // Check for dinner keywords (most common, so check last)
+    if (allTags.includes('dinner') || allTags.includes('protein') ||
+        lowerTitle.includes('chicken') || lowerTitle.includes('beef') ||
+        lowerTitle.includes('pork') || lowerTitle.includes('fish') ||
+        lowerTitle.includes('pasta') || lowerTitle.includes('curry') ||
+        lowerTitle.includes('soup') || lowerTitle.includes('stew')) {
+      return 'Dinner';
+    }
+
+    // Default to main dish if no specific meal type detected
+    return 'Main Dish';
   }
 };
